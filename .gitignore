@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local env (contains local-only settings)
+.env
+
+# Experiment output (CSV metrics, generated graphs)
+results/*.csv
+results/*.png
+
+# OS / editor
+.DS_Store
+Thumbs.db

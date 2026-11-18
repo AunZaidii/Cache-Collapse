@@ -1,0 +1,119 @@
+%% =====================================================================
+\section{Comparative Analysis}
+\label{sec:comparative}
+%% =====================================================================
+
+\subsection{Capability Coverage}
+CacheCollapse integrates concerns that prior work addresses only in prt
+(Table~\ref{tab:capability}). Performance-oriented stampede work
+\cite{vattani2015,nishtala2013} contributes coalescing and early recomputation but no
+attacker model, detection, or testbed. Application-layer DDoS work
+\cite{praseed2019,xie2009,ranjan2009} contributes detection and scheduling but neither
+the cache-specific mechanism nor a reproducible container environment. Work on
+cache- and CDN-targeting attacks \cite{nguyen2019,guo2020,triukose2009} demonstrates
+attacks on shared edge caches but does not address the application-internal cache or
+layered mitigation. Container-security work \cite{combe2016,sultan2019} catalogs
+weaknesses without instrumenting a specific availability attack end to end. The Yo-Yo
+attack \cite{sides2016,bremlerbarr2017} is closest in spirit but targets elasticity
+rather than caching. Overload-control work \cite{welsh2001,welsh2003} supplies general
+mechanisms without an attack model.
+
+\begin{table}[t]
+\centering
+\caption{Capability coverage. \yes~= addressed; \prt~= partial; \no~= not addressed.
+``Analytical'' denotes a quantitative model of the attack or its mitigation.}
+\label{tab:capability}
+\small
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+Work & Adversarial & Testbed & Analytical & Detection & Layered mit. & Containerized \\
+\midrule
+Probabilistic prevention \cite{vattani2015} & \no & \no & \yes & \no & \prt & \no \\
+Memcache leases \cite{nishtala2013} & \no & \no & \no & \no & \prt & \no \\
+App-layer DDoS \cite{xie2009,praseed2019} & \yes & \no & \prt & \yes & \no & \no \\
+DDoS-Shield \cite{ranjan2009} & \yes & \prt & \yes & \yes & \prt & \no \\
+Flash crowds \cite{jung2002,kandula2005} & \yes & \prt & \no & \yes & \prt & \no \\
+DDoS surveys \cite{mirkovic2004,zargar2013} & \yes & \no & \no & \prt & \prt & \no \\
+CPDoS / CDN abuse \cite{nguyen2019,guo2020} & \yes & \yes & \no & \no & \prt & \no \\
+Container security \cite{combe2016,sultan2019} & \prt & \no & \no & \no & \no & \prt \\
+Yo-Yo attack \cite{sides2016,bremlerbarr2017} & \yes & \prt & \yes & \prt & \no & \yes \\
+Overload control \cite{welsh2001,welsh2003} & \no & \yes & \prt & \prt & \prt & \no \\
+\textbf{CacheCollapse} & \yes & \yes & \yes & \yes & \yes & \yes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Comparison of Mitigation Techniques}
+Table~\ref{tab:mitigations} compares the mitigations available against a cache stampede
+along six dimensions. Two observations stand out. First, the techniques fall into two
+groups: those that reduce the \emph{probability} of a synchronized miss (TTL jitter,
+early recomputation, longer TTLs) and those that bound its \emph{cost} once it happens
+(single-flight, stale serving, rate limiting, admission control). An adversary who
+can time bursts defeats the first group---jitter adds noise the attacker can average
+away by probing, and early recomputation only refreshes keys that are being read
+anyway---so a security-oriented design must include the second group. Second, within
+the second group only edge-level controls protect the proxy and connection path. This
+is the empirical result of Section~\ref{sec:ablation} restated as a design rule.
+
+\begin{table}[t]
+\centering
+\caption{Comparison of stampede mitigations. ``Root cause'' = removes redundant
+regeneration; ``Proxy'' = protects the proxy/connection path; ``Adversarial'' = remains
+effective when bursts are deliberately timed.}
+\label{tab:mitigations}
+\footnotesize
+\begin{tabularx}{\linewidth}{@{}L{3.1cm}cccccY@{}}
+\toprule
+Technique & Root cause & Protects DB & Proxy & Adversarial & Staleness & Cost / caveat \\
+\midrule
+Longer TTL & \no & \prt & \no & \no & Higher & Fewer but equally large stampedes (Eq.~\ref{eq:stampede}) \\
+TTL jitter & \no & \prt & \no & \no & Same & De-synchronizes bulk fills only \\
+Early recomputation (XFetch) \cite{vattani2015} & \prt & \prt & \no & \prt & Same & Needs regeneration-cost estimate; read-triggered \\
+Single-flight lock / lease \cite{nishtala2013,singleflight} & \yes & \yes & \no & \yes & Same & Losers must wait or be served something \\
+Stale-while-revalidate \cite{rfc5861} & \prt & \yes & \no & \yes & Bounded & Requires a stale copy (pre-warm) \\
+App-layer rate limit & \no & \prt & \no & \prt & None & Acts after the proxy and app have paid for the request \\
+Edge rate limit \cite{nginxlimitreq} & \no & \prt & \yes & \yes & None & Per-address; weak against many sources \\
+Admission control \cite{welsh2003,cherkasova2002} & \no & \yes & \prt & \yes & None & Needs a load signal; may reject legitimate users \\
+Auto-scaling & \no & \prt & \prt & \no & None & Slow; itself attackable (Yo-Yo) \cite{sides2016} \\
+\textbf{CacheCollapse (lock + SWR + app + edge RL)} & \yes & \yes & \yes & \yes & Bounded (60 s) & Per-address limit; see Sec.~\ref{sec:limitations} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Comparison of Detection Approaches}
+Table~\ref{tab:detcompare} positions the two CacheCollapse detectors relative to
+generic approaches. The comparison underlines why we chose to deploy both: a
+volume threshold is cheap but cannot tell harm from popularity
+(Table~\ref{tab:single}); behavioral models of browsing \cite{xie2009} and
+session-suspicion scoring \cite{ranjan2009} require per-client modeling that a
+stampede, made of identical requests for public objects, does not reward; supervised
+classifiers require labelled attacks that rarely exist in production. The rule and
+the unsupervised forest need neither per-client state nor labels.
+
+\begin{table}[t]
+\centering
+\caption{Detection approaches for the cache-stampede IDDoS.}
+\label{tab:detcompare}
+\footnotesize
+\begin{tabularx}{\linewidth}{@{}L{3.2cm}L{1.7cm}L{1.8cm}L{1.8cm}Y@{}}
+\toprule
+Approach & Labels needed & Detects harm or novelty & Explainable & Main weakness here \\
+\midrule
+Request-volume threshold & No & Novelty (volume) & Yes & Fires on absorbed bursts (97\%) \\
+Per-client browsing model \cite{xie2009} & Normal only & Novelty & Partly & Stampede requests are individually normal \\
+Session suspicion scoring \cite{ranjan2009} & No & Novelty & Partly & Many sources defeat per-session state \\
+Supervised classifier & Attack + normal & Either & Rarely & Labelled attacks unavailable \\
+\textbf{Multi-signal rule (ours)} & No & Harm & Fully & Conservative thresholds; recall 0.27 \\
+\textbf{IsolationForest (ours)} & Normal only & Novelty & Weakly & Needs clean window; flags idleness \\
+\textbf{Rule OR forest (ours)} & Normal only & Both & Partly & 12/12 episodes, FPR 0.3\% \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Positioning}
+In summary, CacheCollapse is not a new mitigation primitive: single-flight
+regeneration, stale serving, and rate limiting all predate it. Its contribution is to
+treat the stampede as an adversarial availability problem and to show,
+quantitatively and reproducibly, how these primitives must be composed, what each one
+protects, how quickly they act, and how the attack can be detected without labels and
+without confusing harm with popularity.

@@ -1,0 +1,187 @@
+%% =====================================================================
+\section{Discussion}
+\label{sec:discussion}
+%% =====================================================================
+
+\subsection{Why a Layered Defense Is Necessary}
+No single control is sufficient. Cache locking is the only mechanism that addresses the
+root cause---it restores the $N{:}1$ query ratio to $1{:}1$, as the coalescing ratio of
+4.7 shows---but it operates below the proxy and cannot relieve congestion of the
+connection path. Stale-while-revalidate makes locking \emph{fast} by giving losers an
+immediate answer, but only if a stale copy exists, which is why pre-warming matters.
+Application-layer rate limiting sheds database work but acts too late: by the time the
+application rejects a request, the proxy and the application have already paid for
+it. Edge rate limiting protects the proxy but, on its own, would not fix the
+redundant-query amplification of whatever traffic it admits. The correct design
+composes them in the order requests encounter them: the edge limiter caps the flood,
+cache locking coalesces the surviving misses, and stale-while-revalidate serves the
+coalesced waiters without delay. This mirrors the prevention--detection--response
+framing urged for DDoS defense \cite{zargar2013} and the overload-control principle of
+shedding load as early as possible \cite{welsh2001,beyer2016}.
+
+\subsection{Detecting Harm versus Detecting Novelty}
+The detection results argue against treating the two detectors as substitutes, and
+they suggest a sharper way to describe the difference than ``rules versus machine
+learning''. The rule is a detector of \emph{harm}: it fires only when the database is
+demonstrably overloaded, so it is silent on absorbed bursts, silent on defended
+attacks, and silent when idle. The IsolationForest is a detector of \emph{novelty}: it
+fires whenever the traffic vector leaves the region it was trained on, which happens
+during attacks, but also during idleness and partly during defended attacks. Both
+questions are useful. Harm is what an on-call engineer must act on; novelty is what a
+security analyst wants to know about even when the defenses are holding, because a
+defended attack is still an attack. A practical deployment should therefore route the
+two signals differently---the rule to paging, the forest to a security dashboard---and
+should give the forest an explicit notion of ``no traffic'' (for example, by not
+scoring intervals with fewer than a minimum number of requests) to avoid the
+closed-world false alarms we observed \cite{sommer2010}.
+
+The analysis also shows that a plausible-sounding signal can be misleading. The
+stampede narrative suggests that the cache-miss ratio should spike during an attack,
+and it was included in the rule for that reason. In this testbed it does not: the short
+TTL and uniform catalog make the normal miss ratio high (0.62), and during the attack
+the high-volume, repeatedly requested hot keys are hits most of the time between
+expiries, so the ratio actually falls (0.51). Equation~\eqref{eq:baseline} predicts the
+first effect from first principles. The lesson for practitioners is to validate every
+detection feature against a model or a measurement of normal behavior, and to prefer
+signals that directly measure the protected resource (database attempts, pool
+exhaustion) over proxies for it.
+
+\subsection{Engineering Lessons from Building the Testbed}
+\label{sec:lessons}
+Several of the most instructive results emerged as bugs during development. Table
+\ref{tab:bugs} summarizes them; each is a reusable lesson for anyone building or
+defending a cached service.
+
+\begin{table}[t]
+\centering
+\caption{Defects found during development, their causes, and the general lesson.}
+\label{tab:bugs}
+\footnotesize
+\begin{tabularx}{\linewidth}{@{}L{2.9cm}L{3.3cm}L{3.3cm}Y@{}}
+\toprule
+Symptom & Root cause & Fix & General lesson \\
+\midrule
+Defended shop still slow; attacker throttled legitimate users & Limiter keyed on the proxy's address; all clients shared one budget & Proxy overwrites \texttt{X-Forwarded-For} with the real peer address & Per-client limits behind a proxy need trusted client identity \\
+Defended latency up to ${\approx}2.5$~s & Lock losers queued behind the winner & Serve the stale copy immediately (SWR); pre-warm stale cache & Coalescing must not turn into queueing \\
+Shop slow (300--700~ms) even with DB protected & Flood still congested Nginx and the app's threads & Edge \texttt{limit\_req}, toggled live via include + reload & Protect the request path, not only the database \\
+Single false alarm at start of baseline & Cold cache: every request misses, looks like a stampede & Suppress alerts for 3~s warm-up; train ML only after it & Distinguish start-up transients from attacks \\
+ML stopped recognizing attacks & Cold-start spike polluted the ``normal'' training set & Skip warm-up; standardize features & Training data hygiene determines unsupervised accuracy \\
+Occasional one-interval ML alert & Noise in a single sample & Two-interval debounce; contamination 0.03$\rightarrow$0.01 & Debounce novelty detectors \\
+Metric totals split and inconsistent & Several Gunicorn workers, each with its own counters & One worker, 200 threads & In-process metrics need a single process (or multiprocess mode) \\
+Shop stuck ``red'' after attack ended & Browser fetches without timeout piled up & 4~s \texttt{AbortController} timeout; non-overlapping refresh & Clients need timeouts too, or they amplify outages \\
+Dashboard felt laggy & 1~Hz sampling & 2~Hz sampling and streaming & Rates need enough samples per window; 2~Hz suffices \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Deployment Guidance}
+For operators of cached, containerized web services, the results translate into the
+following checklist:
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Coalesce regeneration of hot keys} with a single-flight lock or lease,
+and release locks with a token check \cite{kleppmann2016}.
+\item \textbf{Keep a stale copy} of hot entries and serve it to lock losers
+(stale-while-revalidate); pre-warm it at start-up so the defense works from the first
+miss.
+\item \textbf{Rate-limit at the edge}, not only in the application, and return 429
+rather than 503 for intentional shedding (\texttt{limit\_req\_status 429}).
+\item \textbf{Forward trusted client identity} from the proxy (overwrite, never
+append, \texttt{X-Forwarded-For} at the outermost trusted hop) so per-client limits are
+meaningful.
+\item \textbf{Choose pool behavior deliberately.} A fail-fast pool converts overload
+into immediate errors (good for shedding, bad for goodput under stampede); a bounded
+wait with a short timeout may preserve more useful work.
+\item \textbf{Monitor the protected resource directly}: database attempts, pool
+exhaustion, and failures, together with latency. Validate any proxy signal (such as
+miss ratio) against normal behavior before alerting on it.
+\item \textbf{Run both a harm detector and a novelty detector}, route them to
+different audiences, and train the novelty detector on a clean, sufficiently long
+window that excludes start-up and idle periods.
+\item \textbf{Treat TTLs as public.} Hit/miss timing reveals them; do not rely on
+obscurity or jitter for protection.
+\end{enumerate}
+All of these are realizable with standard components---Redis, Nginx, and a metrics
+pipeline---and none requires changes to application semantics beyond accepting bounded
+staleness.
+
+\subsection{Security of the Testbed and Ethical Considerations}
+\label{sec:ethics}
+CacheCollapse is a tool for generating denial-of-service traffic, and it was designed
+to be safe by construction. The attack generator targets only the stack's own proxy on
+a private network; no external system is ever contacted; and all data are synthetic.
+The control API that launches attacks is intentionally unauthenticated for classroom
+use, and Grafana ships with default credentials and anonymous viewing. These choices
+are acceptable on a laptop but not on any reachable host. The project's deployment
+plan accordingly restricts exposure to known addresses via a cloud firewall, requires
+changing default passwords, and recommends local demonstration as the safest option;
+a helper script that publishes the dashboard through a temporary tunnel should be used
+only for short, supervised sessions, since anyone with the link can launch the attack
+against the demo itself. The techniques described here are well known to defenders and
+attackers alike; we believe that publishing a reproducible, defensive-first account of
+them, with mitigations and detection, benefits defenders more than it helps attackers.
+
+\subsection{Threats to Validity}
+\label{sec:validity}
+\paragraph{Construct validity (are we measuring what we claim?).} The log analysis
+exposed several measurement subtleties that affect interpretation:
+\begin{itemize}[leftmargin=*]
+\item \emph{Database ``queries'' are attempts.} The counter is incremented before a
+pool connection is obtained, so under overload it includes attempts rejected with 503.
+We therefore report ``attempts'' and derive completed queries separately
+(Section~\ref{sec:mechanics}).
+\item \emph{Failures are logged as per-interval counts}, not per-second rates. With
+0.5~s intervals the two differ by a factor of two; all rates in this paper divide by
+the measured interval.
+\item \emph{Hits and misses overlap under defense}, because a lock loser served stale
+data is counted as both a miss and a hit; the defended miss ratio is therefore biased
+low, while the coalescing ratio is unaffected.
+\item \emph{Latency is measured inside the application.} It excludes time spent in the
+proxy and requests rejected at the edge; the storefront and the test suite provide the
+complementary end-to-end view.
+\item \emph{p95 latency is quantized} to histogram bucket bounds and is therefore
+reported only as supporting evidence.
+\item \emph{Edge rejections are invisible to the application metrics} and, with Nginx
+defaults, are HTTP~503 at the client.
+\item \emph{Per-container CPU and memory} were part of the original specification but
+are not collected by the final monitor (Prometheus scrapes only the application), so
+no resource-utilization results are reported.
+\item \emph{Defense configuration is not logged per interval.} The mode ``protected''
+means ``at least one defense on''; the ablation therefore relies partly on observation
+and on the session history rather than on per-interval labels.
+\end{itemize}
+
+\paragraph{Internal validity.} The attacker, the victim, and the monitor share one
+host's CPU, so heavy attack traffic also slows the instrumentation; the monitor's
+sampling interval stretches under load (median 0.53~s overall, longer during attacks).
+Mode labels can lag traffic changes by up to one interval, which affects detection
+latencies at the 0.5~s scale but not episode-level conclusions.
+
+\paragraph{External validity.} The testbed is a single-host Docker Desktop deployment
+whose port forwarding adds latency under heavy connection load, so absolute latencies
+are environment-specific while relative effects are robust. Traffic is synthetic:
+popularity is uniform rather than Zipf-like \cite{breslau1999}, database cost is
+modelled with \texttt{pg\_sleep}, and both normal and attack traffic originate from a
+single load-generator address. The last point has two consequences: the edge limiter
+also throttles the synthetic normal traffic (which is why defended database load falls
+below the baseline), and per-address limiting is easier than it would be against a
+distributed attacker using many addresses. Legitimate-user availability under defense
+is therefore evidenced by the storefront and test case~16, which originate from a
+different address, rather than by the synthetic background traffic.
+
+\paragraph{Conclusion validity.} The main results come from one final session.
+Consecutive intervals are autocorrelated, so bootstrap intervals computed over
+intervals understate uncertainty; the episode-level and cross-session results
+(Figures~\ref{fig:dev} and~\ref{fig:detlat}) provide the more conservative evidence and
+are consistent with the interval-level estimates.
+
+\subsection{Limitations}
+\label{sec:limitations}
+Beyond the validity threats above, the study has the following limitations. The
+IsolationForest requires a clean baseline window, so a system attacked from start-up
+trains on contaminated data or not at all (as in the first episode of the final
+session); the always-available rule mitigates but does not eliminate this. Thresholds
+($K$, $\tau_L$, $\tau_m$, limiter rates) were tuned on the testbed and need site-specific
+calibration. The edge limiter is per source address and would need to be complemented
+by aggregate or behavioral limiting against a widely distributed attacker. Finally, the
+study evaluates a single cache, a single database, and a single application replica;
+interactions with replication, sharding, and auto-scaling are left to future work.

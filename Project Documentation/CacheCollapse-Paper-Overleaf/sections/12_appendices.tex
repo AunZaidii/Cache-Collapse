@@ -1,0 +1,162 @@
+%% =====================================================================
+%% Appendices
+%% =====================================================================
+
+\section{Reproduction Guide}
+\label{app:repro}
+
+\paragraph{Prerequisites.} Docker Desktop (or Docker Engine with the Compose plugin),
+about 2~GB of free RAM, and a free TCP port 8090 (configurable as \texttt{PUBLIC\_PORT}
+in \texttt{.env}). Python~3 is needed only to run the test suite.
+
+\paragraph{Start the stack.}
+\begin{lstlisting}[language=bash, numbers=none]
+docker compose up --build        # first run downloads images and builds (minutes)
+docker compose ps                # all 9 services Up; db (healthy)
+\end{lstlisting}
+
+\paragraph{Endpoints.}
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Dashboard (live operations console) & \url{http://localhost:8090} \\
+CacheShop storefront & \url{http://localhost:8090/shop.html} \\
+Product API & \url{http://localhost:8090/api/products/<id>} \\
+Grafana & \url{http://localhost:3000} \\
+Prometheus & \url{http://localhost:9090} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Run the three experiments.} Use the dashboard presets \emph{Exp~1}
+(baseline), \emph{Exp~2} (attack, no defense), and \emph{Exp~3} (attack with defenses),
+or call the control API directly:
+\begin{lstlisting}[language=bash, numbers=none]
+curl -X POST localhost:8090/control/preset -H 'Content-Type: application/json' -d '{"exp":1}'
+curl -X POST localhost:8090/control/preset -H 'Content-Type: application/json' -d '{"exp":2}'
+curl -X POST localhost:8090/control/reset
+curl -X POST localhost:8090/control/preset -H 'Content-Type: application/json' -d '{"exp":3}'
+\end{lstlisting}
+Allow at least 5--10~s of baseline traffic before an attack so that the ML detector can
+train. Each monitor start creates a new \texttt{results/metrics\_<timestamp>.csv}.
+
+\paragraph{Validate.}
+\begin{lstlisting}[language=bash, numbers=none]
+python tests/test_cachecollapse.py   # expected: SUMMARY: 16 passed, 0 failed
+\end{lstlisting}
+
+\paragraph{Stop.} \texttt{docker compose down} (add \texttt{-v} to remove volumes).
+
+\section{Key Configuration Listings}
+\label{app:listings}
+
+\begin{lstlisting}[caption={Nginx: edge rate-limit zone, client-address forwarding, and the live-reloadable include (excerpt of \texttt{nginx/nginx.conf}).}, label={lst:nginx}]
+limit_req_zone $binary_remote_addr zone=api_rl:10m rate=50r/s;
+upstream backend { server backend:5000; keepalive 64; }
+
+location /api/ {
+    proxy_set_header X-Forwarded-For $remote_addr;   # overwrite, not append
+    proxy_set_header X-Real-IP $remote_addr;
+    include /etc/nginx/dynamic/ratelimit.conf;      # rewritten by the monitor
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_pass http://backend/;
+}
+# dynamic/ratelimit.conf when ON:
+#   limit_req zone=api_rl burst=20 nodelay;
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Nginx container command: start Nginx and reload it whenever the edge rate-limit include changes (excerpt of \texttt{docker-compose.yml}).}, label={lst:watcher}]
+nginx -g 'daemon off;' &
+prev=""
+while :; do
+  sleep 1
+  cur=$(cat /etc/nginx/dynamic/ratelimit.conf 2>/dev/null)
+  if [ "$cur" != "$prev" ]; then prev="$cur"; nginx -s reload 2>/dev/null; fi
+done
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python, caption={Rule-based detector (\texttt{monitor/detect\_rules.py}).}, label={lst:rule}]
+DB_MULTIPLIER = 5       # "high DB load" = more than 5x the learned baseline
+BASELINE_FLOOR = 5      # never treat less than this many q/s as the baseline
+RESP_MS_LIMIT = 200     # "high response time"
+MISS_RATE_LIMIT = 0.5   # "high miss rate"
+
+def evaluate(sample, baseline_db):
+    base = max(baseline_db, BASELINE_FLOOR)
+    c1 = sample["db_qps"] > DB_MULTIPLIER * base
+    c2 = sample["resp_avg_ms"] > RESP_MS_LIMIT
+    c3 = sample["miss_rate"] > MISS_RATE_LIMIT
+    return {"db_load": c1, "response": c2, "miss_rate": c3}, (c1 and c2 and c3)
+\end{lstlisting}
+
+\begin{lstlisting}[language=Python, caption={IsolationForest detector core (\texttt{monitor/detect\_ml.py}).}, label={lst:ml}]
+FEATURES = ["db_qps", "resp_avg_ms", "miss_rate", "rps", "failed"]
+MIN_TRAIN = 10
+
+def observe_baseline(self, sample):
+    self._baseline.append([sample[f] for f in FEATURES])
+    if len(self._baseline) >= MIN_TRAIN:
+        self._baseline = self._baseline[-300:]
+        data = np.array(self._baseline, dtype=float)
+        self._scaler = StandardScaler().fit(data)
+        self._model = IsolationForest(contamination=0.01, random_state=0)
+        self._model.fit(self._scaler.transform(data))
+
+def score(self, sample):
+    if self._model is None:
+        return 0.08, False
+    x = self._scaler.transform([[sample[f] for f in FEATURES]])
+    raw = float(self._model.decision_function(x)[0])  # +normal / -anomaly
+    return max(0.0, min(1.0, 0.5 - raw * 4.0)), self._model.predict(x)[0] == -1
+\end{lstlisting}
+
+\section{Mapping to the Attributes of a Complex Engineering Problem}
+\label{app:cep}
+Table~\ref{tab:cep} maps the project onto the attributes of a complex engineering
+problem defined in the International Engineering Alliance's graduate attributes
+\cite{ieagapc2021}, which underlie the accreditation criteria applied to this course.
+
+\begin{table}[h]
+\centering
+\caption{Complex engineering problem attributes addressed by CacheCollapse.}
+\label{tab:cep}
+\footnotesize
+\begin{tabularx}{\linewidth}{@{}L{3.6cm}Y@{}}
+\toprule
+Attribute & How it is addressed \\
+\midrule
+WP1 Depth of knowledge & Caching theory, queueing and overload (Sec.~\ref{sec:bg-queueing}), rate-limiting algorithms, anomaly detection (Sec.~\ref{sec:bg-iforest}), container orchestration \\
+WP2 Range of conflicting requirements & Database protection vs.\ user latency vs.\ data freshness vs.\ false alarms (tensions T1--T3, Sec.~\ref{sec:intro}) \\
+WP3 Depth of analysis & Analytical model (Sec.~\ref{sec:model}), statistical evaluation, threshold sensitivity, ROC, ablation, longitudinal analysis (Sec.~\ref{sec:results}) \\
+WP4 Familiarity of issues & Reframes a known performance hazard as an adversarial, emergent availability attack that cannot be patched \\
+WP5 Extent of applicable codes & HTTP semantics (RFC 6585, RFC 5861), OWASP API Top 10, MITRE ATT\&CK, NIST SP 800-61 (Sec.~\ref{sec:threat}) \\
+WP6 Stakeholder involvement & End users, operators, security analysts, instructor/audience; separate harm and novelty alerting for operators vs.\ analysts \\
+WP7 Interdependence & Nine interacting services; defenses at different layers that are only effective in combination (Sec.~\ref{sec:ablation}) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Glossary}
+\label{app:glossary}
+\begin{description}[leftmargin=1.2em,style=nextline,itemsep=1pt]
+\item[Cache-aside] Pattern in which the application reads the cache and, on a miss,
+loads from the database and fills the cache.
+\item[Cache stampede (dog-pile, thundering herd)] Many concurrent misses for the same
+key regenerating it simultaneously.
+\item[Coalescing ratio $\rho$] Cache misses per database attempt; 1 without coalescing.
+\item[Edge rate limiting] Limiting applied at the outermost proxy, before requests
+consume upstream resources.
+\item[Fail-fast pool] A connection pool that rejects requests immediately when all
+connections are in use.
+\item[Goodput] Useful completed work per unit time, as opposed to attempted work.
+\item[IDDoS] Indirect (distributed) denial of service: overloading one component by
+sending legitimate requests to another.
+\item[IsolationForest] Unsupervised anomaly detector that scores points by how quickly
+random trees isolate them.
+\item[Single-flight] Allowing only one in-progress regeneration per key.
+\item[Stale-while-revalidate (SWR)] Serving a slightly old copy while one request
+refreshes the entry.
+\item[TTL] Time-to-live of a cache entry.
+\end{description}

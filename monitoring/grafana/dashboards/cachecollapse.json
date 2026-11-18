@@ -1,0 +1,36 @@
+{
+  "title": "CacheCollapse",
+  "uid": "cachecollapse",
+  "schemaVersion": 39,
+  "time": {"from": "now-5m", "to": "now"},
+  "refresh": "2s",
+  "panels": [
+    {
+      "type": "timeseries", "title": "DB queries / sec",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "fieldConfig": {"defaults": {"color": {"mode": "fixed", "fixedColor": "red"}}},
+      "targets": [{"expr": "rate(cc_db_queries_total[10s])", "legendFormat": "db qps"}]
+    },
+    {
+      "type": "timeseries", "title": "Request latency (avg, ms)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [{"expr": "rate(cc_latency_seconds_sum[10s]) / clamp_min(rate(cc_latency_seconds_count[10s]), 0.001) * 1000", "legendFormat": "avg ms"}]
+    },
+    {
+      "type": "timeseries", "title": "Cache hits vs misses / sec",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {"expr": "rate(cc_cache_hits_total[10s])", "legendFormat": "hits"},
+        {"expr": "rate(cc_cache_misses_total[10s])", "legendFormat": "misses"}
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Requests & failures / sec",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {"expr": "sum(rate(cc_requests_total[10s]))", "legendFormat": "requests"},
+        {"expr": "rate(cc_failed_total[10s])", "legendFormat": "failed"}
+      ]
+    }
+  ]
+}

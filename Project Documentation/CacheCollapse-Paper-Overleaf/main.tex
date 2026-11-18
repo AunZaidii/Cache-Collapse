@@ -1,0 +1,166 @@
+%% =====================================================================
+%% CacheCollapse -- extended journal version
+%% Compile with pdfLaTeX + BibTeX (e.g. on Overleaf):
+%%   pdflatex main -> bibtex main -> pdflatex main -> pdflatex main
+%% The original 2-column conference version is kept as main_v1_conference.tex
+%% =====================================================================
+\documentclass[preprint,12pt]{elsarticle}
+
+% ---- packages --------------------------------------------------------
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{longtable}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{listings}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{enumitem}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,shapes.geometric,fit,calc,backgrounds}
+\usepackage[hidelinks]{hyperref}
+
+\setlength{\parskip}{3pt}
+\renewcommand{\arraystretch}{1.15}
+\captionsetup{font=small,labelfont=bf}
+
+% wrapping column types
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcommand{\yes}{\checkmark}
+\newcommand{\no}{$\times$}
+\newcommand{\prt}{$\sim$}
+
+% code listings
+\definecolor{codebg}{HTML}{F6F6F4}
+\definecolor{codekw}{HTML}{1C5CAB}
+\definecolor{codecm}{HTML}{6B6A66}
+\definecolor{codestr}{HTML}{A8461E}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codebg},
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecm}\itshape,
+  stringstyle=\color{codestr},
+  frame=single, rulecolor=\color{black!20},
+  breaklines=true, columns=fullflexible,
+  numbers=left, numberstyle=\tiny\color{black!50}, xleftmargin=1.6em,
+  showstringspaces=false, captionpos=b
+}
+
+\journal{SE-401 Information Security -- Complex Engineering Problem}
+
+\begin{document}
+
+\begin{frontmatter}
+
+\title{CacheCollapse: Reproducing, Detecting, and Mitigating Cache-Stampede-Driven
+Indirect Denial of Service in Containerized Web Applications}
+
+\author{Manal Aamir (SE-23070)}
+\author{Tayyaba Arshad (SE-23073)}
+\author{Noor Afza (SE-23075)}
+\author{Batool Fatima (SE-23076)}
+\author{Aun Zaidi (SE-23095)}
+\address{Department of Software Engineering, NED University of Engineering and
+Technology, Karachi, Pakistan}
+
+\begin{abstract}
+Containerized web applications almost universally place an in-memory cache between a
+stateless application tier and a relational database. This design is efficient under
+steady load but hides a structural availability weakness: when a popular cache entry
+expires, a burst of otherwise legitimate concurrent requests misses the cache at the
+same instant and is forwarded, unthrottled, to the database. The resulting
+\emph{cache stampede} converts a modest amount of normal-looking traffic into a flood
+of redundant database work. Because the adversary never contacts the database and never
+violates an application rule, the event is an \emph{indirect} denial of service that
+volume-based network defenses are not designed to catch. This paper presents
+\textbf{CacheCollapse}, a fully containerized testbed and defense framework that
+(i)~reproduces the cache-stampede attack on a nine-container
+Nginx--Flask--Redis--PostgreSQL stack, (ii)~detects it in real time with an
+explainable multi-signal rule and an unsupervised IsolationForest trained only on
+normal traffic, and (iii)~mitigates it with a layered defense of single-flight cache
+locking with stale-while-revalidate, application-layer rate limiting, and edge rate
+limiting at the reverse proxy. We analyze 18 monitoring logs (92{,}531 samples,
+${\approx}28$~h) and report the final configuration in detail (61{,}923 samples
+including 12 undefended attack episodes and 5.6~h of sampled defended attack). Under the undefended attack the median rate of database query attempts rose
+from 11 to 108 per second (peak 317), median interval latency from 77 to 174~ms (peak
+1{,}159~ms), and 80\% of sampling intervals contained HTTP~503 failures (median
+84~failures/s). With the layered defense the median database load fell to
+6~queries/s---an 18$\times$ reduction (95\% bootstrap CI 16.8--19.2$\times$)---median
+latency fell to 27~ms, and failures were effectively eliminated; recovery after
+enabling defenses mid-attack took a median of 1.35~s. The union of the two detectors
+caught 12 of 12 attack episodes with one false alarm in 332 normal intervals; the
+IsolationForest was fast (median 0.85~s, interval recall 0.91) while the rule was
+slower (median 3.2~s, recall 0.27) but perfectly precise and, unlike a volume
+threshold that fired on 97\% of absorbed high-volume bursts, never fired on traffic
+that the cache absorbed. An ablation and the development history show that cache
+locking protects the database but not the proxy path, so edge rate limiting is
+required to keep legitimate users fast. We also report measurement caveats uncovered by
+the analysis and derive deployment guidance for operators of cached services.
+\end{abstract}
+
+\begin{keyword}
+Cache stampede \sep thundering herd \sep indirect denial of service \sep
+application-layer DDoS \sep containerized security \sep rate limiting \sep cache
+locking \sep anomaly detection \sep isolation forest \sep availability
+\end{keyword}
+
+\end{frontmatter}
+
+\section*{Highlights}
+\begin{itemize}[leftmargin=*]
+\item A reproducible nine-container Docker Compose testbed turns an ordinary
+Nginx--Flask--Redis--PostgreSQL stack into a controllable cache-stampede laboratory;
+an undefended attack drove median database query attempts ${\approx}10\times$ above
+baseline (peak ${\approx}29\times$) and produced HTTP~503 failures in 80\% of sampling
+intervals.
+\item A layered defense (single-flight locking with stale-while-revalidate, application
+and edge rate limiting) cut median database load 18$\times$ and median latency
+6.4$\times$, held through a 4.5-hour soak under continuous attack, and recovered in a
+median of 1.35~s when enabled mid-attack.
+\item Across 12 attack episodes, a multi-signal rule (precision 1.00) and an
+unsupervised IsolationForest (recall 0.91) jointly detected every attack; the rule
+never fired on high-volume traffic that the cache absorbed, whereas a volume threshold
+fired on 97\% of it.
+\item Analysis of the logs exposes non-obvious measurement pitfalls---the cache-miss
+rate is a weak stampede signal under short TTLs, and goodput collapses to
+${\approx}23$ completed queries/s, far below nominal pool capacity---and yields concrete
+deployment guidance.
+\end{itemize}
+
+\clearpage
+\tableofcontents
+\clearpage
+
+\input{sections/01_introduction}
+\input{sections/02_background}
+\input{sections/03_related_work}
+\input{sections/04_threat_model}
+\input{sections/05_design}
+\input{sections/06_methodology}
+\input{sections/07_results}
+\input{sections/08_comparative}
+\input{sections/09_discussion}
+\input{sections/10_conclusion}
+\input{sections/11_backmatter}
+
+\bibliographystyle{elsarticle-num}
+\bibliography{references}
+
+\clearpage
+\appendix
+\input{sections/12_appendices}
+
+\end{document}

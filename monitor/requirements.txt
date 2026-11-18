@@ -1,0 +1,7 @@
+Flask==3.0.3
+redis==5.0.8
+requests==2.32.3
+prometheus-client==0.20.0
+scikit-learn==1.5.1
+numpy==1.26.4
+gunicorn==22.0.0

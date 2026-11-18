@@ -1,0 +1,174 @@
+%% =====================================================================
+\section{Background}
+\label{sec:background}
+%% =====================================================================
+
+This section introduces the concepts on which the rest of the paper depends: caching
+patterns and expiry semantics, the cache stampede, overload behavior of connection
+pools, rate-limiting algorithms, unsupervised anomaly detection with isolation
+forests, and the container and observability tooling used by the testbed.
+
+\subsection{Caching Patterns and Expiry Semantics}
+\label{sec:bg-caching}
+Three caching patterns dominate web back ends \cite{kleppmann2017}:
+\begin{itemize}[leftmargin=*]
+\item \textbf{Cache-aside (lazy loading).} The application reads the cache; on a miss
+it reads the database and writes the result into the cache. The cache never talks to
+the database itself. This is the pattern used by CacheCollapse and by the memcache
+deployment described by Nishtala et al.\ \cite{nishtala2013}.
+\item \textbf{Read-through.} The cache library itself loads missing values from the
+database, which centralizes regeneration but does not by itself prevent concurrent
+regeneration of the same key.
+\item \textbf{Write-through / write-behind.} Writes update the cache and the database
+together (or asynchronously), keeping entries fresh and reducing reliance on expiry.
+\end{itemize}
+Expiry is usually governed by a TTL. Short TTLs bound staleness but increase the
+rate of expiries; long TTLs reduce database load but serve older data. HTTP caching
+formalizes a useful middle ground: the \texttt{stale-while-revalidate} directive
+allows a cache to serve a stale response for a bounded period while it refreshes the
+entry in the background \cite{rfc5861}. CacheCollapse applies the same idea inside
+the application tier.
+
+Popularity in real workloads is strongly skewed; web object requests follow a
+Zipf-like distribution \cite{breslau1999}, and large key--value workloads concentrate
+a large fraction of requests on a small set of keys \cite{atikoglu2012}. Skew is what
+makes caching effective, and also what makes a few hot keys a single point of
+failure: Fan et al.\ show that a small front-end cache is needed precisely to prevent
+hot keys from overloading individual back-end nodes \cite{fan2011}.
+
+\subsection{The Cache Stampede}
+\label{sec:bg-stampede}
+Consider a hot key $k$ with TTL $T$ and regeneration time $d$ (the time to compute the
+value from the database). Let requests for $k$ arrive at rate $\lambda_k$. If the
+entry expires at time $t_{\mathrm{exp}}$, every request arriving in
+$(t_{\mathrm{exp}}, t_{\mathrm{exp}}+d)$ finds the cache empty. In a naive cache-aside
+implementation each of those requests independently regenerates the value, so the
+expected number of database queries caused by one expiry is
+\begin{equation}
+\mathbb{E}[Q_{\mathrm{exp}}] \approx 1 + \lambda_k d ,
+\label{eq:stampede}
+\end{equation}
+and for a synchronized burst of $B$ concurrent requests it is simply $B$. Equation
+\eqref{eq:stampede} has two important properties. First, the redundant work grows
+with $d$, and $d$ itself grows as the database becomes loaded---a positive feedback
+loop. Second, it is \emph{independent of the TTL}; a longer TTL makes stampedes less
+frequent but not smaller.
+
+Four families of mitigation exist:
+(i)~\emph{request coalescing} (single-flight), in which only one caller regenerates a
+key and the others wait for or reuse its result \cite{nishtala2013,singleflight};
+(ii)~\emph{serving stale data} during regeneration \cite{rfc5861,nygard2018};
+(iii)~\emph{early or probabilistic recomputation} before expiry, which Vattani et al.\
+show can be made optimal with the XFetch rule \cite{vattani2015}; and
+(iv)~\emph{TTL jitter}, which de-synchronizes expiries of keys that were filled at the
+same time. Only the first two remove redundancy once a synchronized burst has already
+arrived; the latter two reduce the probability that it happens.
+
+\subsection{Connection Pools, Queueing, and Overload}
+\label{sec:bg-queueing}
+An application reaches its database through a bounded pool of $c$ connections. If each
+query holds a connection for $d$ seconds, the pool's nominal service capacity is
+\begin{equation}
+\mu_{\max} = \frac{c}{d}\quad\text{queries/s.}
+\label{eq:capacity}
+\end{equation}
+Little's law, $L=\lambda W$ \cite{little1961}, relates the mean number of in-flight
+requests $L$ to the arrival rate $\lambda$ and mean residence time $W$; as $\lambda$
+approaches $\mu_{\max}$ the residence time---and thus latency---grows without bound in
+classical queueing models \cite{kleinrock1975}. Pools differ in what happens at
+saturation. A \emph{blocking} pool queues callers, converting overload into latency;
+a \emph{fail-fast} pool rejects them, converting overload into errors. The psycopg2
+\texttt{ThreadedConnectionPool} used here is fail-fast: requesting a connection from
+an exhausted pool raises an exception immediately \cite{psycopgpool}.
+
+A well-known pathology of overloaded systems is that useful throughput (\emph{goodput})
+can \emph{fall} as offered load rises, because more and more work is spent on requests
+that will ultimately be rejected or time out. This is the essence of congestion
+collapse in networks \cite{jacobson1988} and of receive livelock in operating systems
+\cite{mogul1997}. Overload-control research therefore argues for shedding excess load
+\emph{early}, at the edge of the system, before it consumes scarce resources
+\cite{welsh2001,welsh2003,cherkasova2002,beyer2016}. Tail latency compounds the
+problem: in fan-out services, a small fraction of slow components dominates
+user-perceived latency \cite{dean2013}.
+
+\subsection{Rate-Limiting Algorithms}
+\label{sec:bg-ratelimit}
+Rate limiting caps the rate at which a client (or a class of clients) may consume a
+resource. Table~\ref{tab:ratelimit-algos} summarizes the algorithms relevant to this
+work. The \emph{leaky bucket} smooths output to a constant rate and is the basis of
+Nginx's \texttt{limit\_req} module \cite{nginxlimitreq,tanenbaum2011}; a configurable
+burst allowance lets short spikes through without delay (\texttt{nodelay}). A
+\emph{fixed-window counter} is the simplest to implement on a shared store such as
+Redis: a counter keyed by client and time window is incremented on each request and
+compared with a threshold. Rate limiting can be enforced locally or across a cluster
+\cite{raghavan2007}. HTTP defines status 429 (Too Many Requests) for requests rejected
+by a rate limiter \cite{rfc6585}, distinguishing intentional shedding from server
+failure (status 503).
+
+\begin{table}[t]
+\centering
+\caption{Rate-limiting algorithms relevant to CacheCollapse.}
+\label{tab:ratelimit-algos}
+\small
+\begin{tabularx}{\linewidth}{@{}L{2.6cm}YYL{2.6cm}@{}}
+\toprule
+Algorithm & Mechanism & Strengths / weaknesses & Used here \\
+\midrule
+Fixed window & Counter per client per window; reject above limit & Trivial on Redis; allows up to $2\times$ limit across a window boundary & Flask app layer (1~s window, 50 req/s) \\
+Sliding window & Weighted counts over the last window & Smoother than fixed window; more state & -- \\
+Token bucket & Tokens accrue at rate $r$ up to depth $b$; a request spends one & Permits bursts up to $b$; average rate $r$ & -- \\
+Leaky bucket & Requests drain from a queue at constant rate $r$ & Smooth output; with \texttt{burst}/\texttt{nodelay} behaves like a token bucket & Nginx edge (\texttt{limit\_req}, 50 r/s, burst 20) \\
+Admission control & Admit/reject by measured load & Adapts to capacity; needs a load signal & Discussed (Sec.~\ref{sec:discussion}) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Anomaly Detection and the Isolation Forest}
+\label{sec:bg-iforest}
+Intrusion detection has long been split between \emph{misuse} (signature or rule)
+detection and \emph{anomaly} detection, which models normal behavior and flags
+deviations \cite{denning1987}. Anomaly detection is attractive for attacks without a
+fixed signature, but it is notoriously sensitive to the base rate of attacks
+\cite{axelsson2000}, and machine-learning detectors that perform well in the
+laboratory often fail operationally because ``anomalous'' is not the same as
+``malicious'' \cite{sommer2010}. Surveys organize outlier detection by technique and
+by the availability of labels \cite{chandola2009,hodge2004}.
+
+The \emph{Isolation Forest} (iForest) \cite{liu2008,liu2012} is an unsupervised
+ensemble method that isolates anomalies directly rather than profiling normal points.
+Each of $t$ trees is grown on a sub-sample of $\psi$ points by repeatedly choosing a
+random feature and a random split value between that feature's minimum and maximum,
+until each point is isolated or a height limit is reached. Anomalies, being few and
+different, are isolated near the root, so their path length $h(x)$ is short. The
+anomaly score of a point $x$ is
+\begin{equation}
+s(x,\psi) = 2^{-\frac{\mathbb{E}[h(x)]}{c(\psi)}}, \qquad
+c(\psi) = 2H(\psi-1) - \frac{2(\psi-1)}{\psi},
+\label{eq:iforest}
+\end{equation}
+where $\mathbb{E}[h(x)]$ is the mean path length over the trees, $H(i)\approx\ln i +
+0.5772$ is the harmonic number, and $c(\psi)$ normalizes by the average path length of
+an unsuccessful binary-search-tree lookup. Scores near 1 indicate anomalies; scores
+well below 0.5 indicate normal points. The scikit-learn implementation
+\cite{pedregosa2011} exposes a \texttt{decision\_function} (positive for inliers,
+negative for outliers) whose threshold is set by a \texttt{contamination} parameter,
+the expected fraction of outliers in the training data. Isolation forests require no
+labels, train in near-linear time, and work well with small samples, which makes them
+suitable for learning a ``normal'' profile from a few seconds of live traffic. Unlike
+the supervised random forests from which they borrow the ensemble idea
+\cite{breiman2001}, they cannot learn what an attack looks like---only what normal
+looks like.
+
+\subsection{Containers and Observability}
+\label{sec:bg-containers}
+Containers package an application with its dependencies and isolate it using kernel
+namespaces and control groups \cite{merkel2014,pahl2015}; orchestrators from Docker
+Compose \cite{dockercompose} to Kubernetes \cite{burns2016} wire many containers into
+a microservice application \cite{dragoni2017}. Containers bring their own security
+concerns, chiefly around isolation and configuration \cite{combe2016,sultan2019}, but
+for this study their key property is \emph{reproducibility}: an entire multi-service
+system can be created, attacked, measured, and destroyed from a single declarative
+file. Observability is provided by Prometheus, a pull-based time-series system that
+periodically scrapes text-format metrics endpoints \cite{brazil2018}, visualized with
+Grafana. For low-latency browser dashboards, Server-Sent Events (SSE) provide a simple
+one-way push channel over HTTP.

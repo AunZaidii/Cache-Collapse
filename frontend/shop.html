@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CacheShop</title>
+<style>
+  :root{
+    --bg:#f3f5f8; --panel:#fff; --ink:#1b2430; --muted:#5b6b7f; --line:#dce3ec;
+    --navy:#1f3a5f; --teal:#0f7b7b; --gold:#d98c1f;
+    --good:#1f9d6b; --good-bg:#e7f6ef; --warn:#d9901f; --warn-bg:#fcf2df;
+    --crit:#d6453d; --crit-bg:#fbe8e7;
+    --font:"Segoe UI",system-ui,sans-serif; --mono:ui-monospace,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){:root{
+    --bg:#0e141c;--panel:#161f2b;--ink:#e7eef7;--muted:#93a4b8;--line:#273343;
+    --navy:#4a84c9;--teal:#36b3b0;--gold:#e4a94c;--good:#34c98a;--good-bg:#102a21;
+    --warn:#e4a94c;--warn-bg:#2b2213;--crit:#ef6a62;--crit-bg:#2e1716;color-scheme:dark;
+  }}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font);line-height:1.5}
+  .top{background:var(--navy);color:#fff;padding:14px 20px;border-bottom:3px solid var(--gold);
+    display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .top b{font-size:19px} .top span{font-size:12px;color:#b9cce3}
+  .wrap{max-width:1000px;margin:0 auto;padding:16px}
+  .bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);
+    border-radius:12px;padding:12px 14px;margin-bottom:16px}
+  .health{display:inline-flex;align-items:center;gap:8px;font-weight:600;font-size:14px;padding:6px 12px;border-radius:999px}
+  .health .d{width:9px;height:9px;border-radius:50%;background:currentColor}
+  .ok{background:var(--good-bg);color:var(--good)} .slow{background:var(--warn-bg);color:var(--warn)} .down{background:var(--crit-bg);color:var(--crit)}
+  .stat{font-size:13px;color:var(--muted)} .stat b{color:var(--ink);font-family:var(--mono)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;position:relative;min-height:120px}
+  .card h3{margin:0 0 4px;font-size:15px} .card .price{font-size:20px;font-weight:700;color:var(--teal);font-family:var(--mono)}
+  .card .stock{font-size:12px;color:var(--muted);margin-top:2px}
+  .badge{position:absolute;top:10px;right:10px;font-size:11px;font-family:var(--mono);padding:2px 7px;border-radius:999px}
+  .b-fast{background:var(--good-bg);color:var(--good)} .b-slow{background:var(--warn-bg);color:var(--warn)} .b-fail{background:var(--crit-bg);color:var(--crit)}
+  .card.loading{opacity:.6} .card.fail{border-color:var(--crit)}
+  .note{font-size:12px;color:var(--muted);margin-top:14px;text-align:center}
+  a.link{color:var(--teal)}
+</style>
+</head>
+<body>
+<div class="top"><b>CacheShop</b><span>a demo storefront — the website under attack</span></div>
+<div class="wrap">
+  <div class="bar">
+    <span id="health" class="health ok"><span class="d"></span><span id="healthText">Checking…</span></span>
+    <span class="stat">avg load: <b id="avg">—</b></span>
+    <span class="stat">failed: <b id="fail">0</b></span>
+    <span class="stat" style="margin-left:auto">auto-refresh every 2s · open the <a class="link" href="/">dashboard</a> to launch an attack</span>
+  </div>
+  <div id="grid" class="grid"></div>
+  <p class="note">Each card loads a product from the web app (<span style="font-family:var(--mono)">/api/products/&lt;id&gt;</span>).
+     When the cache is warm they load fast; during a cache-stampede attack this page slows down and products fail to load —
+     that is the attack, seen from a customer's point of view.</p>
+</div>
+
+<script>
+  const IDS = [1,2,3,4,5,6,7,8,9,10,11,12];
+  const grid = document.getElementById('grid');
+  const cards = {};
+  IDS.forEach(id=>{
+    const el = document.createElement('div');
+    el.className='card loading';
+    el.innerHTML = '<div class="badge" id="b'+id+'">…</div><h3 id="n'+id+'">Product '+id+'</h3>'+
+                   '<div class="price" id="p'+id+'">—</div><div class="stock" id="s'+id+'">loading…</div>';
+    grid.appendChild(el); cards[id]=el;
+  });
+
+  // Fetch one product with a hard timeout so a hung request can never leave a
+  // card stuck -- the next refresh always re-tries and recovers.
+  async function loadOne(id){
+    const t0 = performance.now();
+    const ctrl = new AbortController();
+    const timer = setTimeout(()=>ctrl.abort(), 4000);
+    try{
+      const r = await fetch('/api/products/'+id, {cache:'no-store', signal:ctrl.signal});
+      clearTimeout(timer);
+      const ms = Math.round(performance.now()-t0);
+      if(!r.ok){ throw new Error('status '+r.status); }
+      const d = await r.json();
+      cards[id].className = 'card';
+      document.getElementById('n'+id).textContent = d.name;
+      document.getElementById('p'+id).textContent = '$'+d.price.toFixed(2);
+      document.getElementById('s'+id).textContent = d.stock+' in stock';
+      const b = document.getElementById('b'+id);
+      b.className = ms < 300 ? 'badge b-fast' : 'badge b-slow';
+      b.textContent = ms+'ms';
+      return {ms, ok:true};
+    }catch(e){
+      clearTimeout(timer);
+      cards[id].className = 'card fail';
+      document.getElementById('s'+id).textContent = 'unavailable';
+      const b = document.getElementById('b'+id); b.className='badge b-fail'; b.textContent='FAIL';
+      return {ms:4000, ok:false};
+    }
+  }
+
+  async function refresh(){
+    const results = await Promise.all(IDS.map(loadOne));
+    const oks = results.filter(r=>r.ok);
+    const failed = results.length - oks.length;
+    const avg = oks.length ? Math.round(oks.reduce((a,r)=>a+r.ms,0)/oks.length) : 0;
+    document.getElementById('avg').textContent = avg+' ms';
+    document.getElementById('fail').textContent = failed;
+    const h = document.getElementById('health'), ht = document.getElementById('healthText');
+    if(failed>2 || avg>900){ h.className='health down'; ht.textContent='Site struggling'; }
+    else if(failed>0 || avg>350){ h.className='health slow'; ht.textContent='Slow'; }
+    else { h.className='health ok'; ht.textContent='Healthy'; }
+    // Non-overlapping: schedule the NEXT refresh only after this one finishes,
+    // so requests never pile up during an attack (which was leaving cards stuck).
+    setTimeout(refresh, 800);
+  }
+
+  refresh();
+</script>
+</body>
+</html>

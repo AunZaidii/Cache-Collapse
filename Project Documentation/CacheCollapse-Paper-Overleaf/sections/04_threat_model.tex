@@ -1,0 +1,182 @@
+%% =====================================================================
+\section{Threat Model and Analytical Model}
+\label{sec:threat}
+%% =====================================================================
+
+\subsection{System Model and Trust Boundaries}
+The target is a conventional three-tier web service: a public reverse proxy (Nginx),
+a stateless application tier (Flask), an in-memory cache (Redis), and a relational
+database (PostgreSQL). Only the proxy is reachable from outside; the application,
+cache, and database communicate on a private container network. The product read
+endpoint \texttt{GET /products/<id>} follows the cache-aside pattern with a short TTL.
+The single trust boundary that matters for this attack is the public interface of
+the proxy: everything behind it is assumed to be configured correctly and free of
+exploitable defects.
+
+\subsection{Assets and Security Goals}
+The protected assets are (a)~the \emph{availability} of the database and (b)~the
+\emph{responsiveness} of the service as experienced by legitimate users. We state four
+security goals against which the defenses are evaluated:
+\begin{description}[leftmargin=1.2em,style=nextline]
+\item[G1 -- Database protection.] Under attack, the rate of database work must stay
+within the database's capacity and close to its normal level.
+\item[G2 -- User availability.] Under attack, legitimate requests must continue to
+succeed with latency comparable to normal operation.
+\item[G3 -- Timely detection.] An operator must be alerted within seconds of attack
+onset, with negligible false alarms during normal operation.
+\item[G4 -- Fast recovery.] When defenses are enabled (or the attack stops), the system
+must return to a healthy state within seconds, without manual intervention.
+\end{description}
+
+\subsection{Adversary Model}
+Table~\ref{tab:adversary} lists the adversary's assumed capabilities. The adversary is
+an external client who can send any number of well-formed HTTP requests to the public
+endpoint and can observe response times. It cannot reach the cache or the database,
+cannot read internal metrics, does not exploit software vulnerabilities, and does not
+need to forge or poison anything.
+
+\begin{table}[t]
+\centering
+\caption{Adversary capabilities and assumptions.}
+\label{tab:adversary}
+\small
+\begin{tabularx}{\linewidth}{@{}L{4.0cm}L{1.6cm}Y@{}}
+\toprule
+Capability & Assumed? & Notes \\
+\midrule
+Send well-formed HTTP GETs to the public endpoint & Yes & At hundreds of concurrent requests; from one or several source addresses \\
+Observe response latency & Yes & Enables a timing side channel (Sec.~\ref{sec:recon}) \\
+Know or infer the set of hot keys & Yes & Hot products are typically public (front page, promotions) \\
+Know or infer the TTL & Inferable & By probing hit/miss latency over time \\
+Reach Redis or PostgreSQL directly & No & Private network \\
+Read internal metrics or dashboards & No & Control plane not exposed \\
+Exploit code defects, inject, or poison caches & No & Out of scope; attack uses only correct application logic \\
+Spoof client identity to the rate limiter & No (by design) & Proxy overwrites \texttt{X-Forwarded-For} (Sec.~\ref{sec:design-rl}) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Reconnaissance via a Timing Side Channel}
+\label{sec:recon}
+The difference between a cache hit and a miss is large and externally visible. In our
+testbed the first request for a product is served from the database in
+${\approx}137$--$180$~ms, while an immediate repeat is served from Redis in
+${\approx}9$--$12$~ms (Section~\ref{sec:sanity}). An adversary can therefore probe a
+key periodically and record when responses switch from fast to slow, recovering both
+which keys are cached and the TTL. Such probing is low-rate and indistinguishable from
+ordinary browsing. This observation matters for defenders: obscuring the TTL is not a
+viable mitigation, and TTL jitter only adds noise to an estimate that the attacker can
+refine by repeated probing.
+
+\subsection{Attack Chain}
+The attack proceeds as follows:
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Select targets.} Choose a pool of $H$ hot keys whose regeneration is
+expensive.
+\item \textbf{Synchronize with expiry.} Send a burst of $B$ concurrent requests for one
+key at (or after) its expiry. All requests that arrive before the first successful
+regeneration miss the cache.
+\item \textbf{Fan out to the database.} Each miss issues its own database query; with
+a fail-fast pool, misses beyond the pool size fail immediately with HTTP~503, and
+because failed regenerations do not populate the cache, subsequent requests in the
+burst miss as well.
+\item \textbf{Rotate.} Move to the next key in the pool. If the rotation period
+exceeds the TTL, every burst lands on an expired entry and the overload becomes
+\emph{sustained} rather than a momentary spike.
+\end{enumerate}
+
+\subsection{Mapping to Threat Frameworks}
+Table~\ref{tab:frameworks} maps the attack onto common threat-modeling vocabularies.
+Under STRIDE \cite{shostack2014} it is a pure Denial-of-Service threat. In MITRE
+ATT\&CK it falls under Endpoint Denial of Service (T1499), most closely the
+\emph{Application Exhaustion Flood} and \emph{Service Exhaustion Flood} sub-techniques
+\cite{mitret1499}. In the OWASP API Security Top~10 it is an instance of
+\emph{Unrestricted Resource Consumption} (API4:2023) \cite{owaspapi2023}, with the
+twist that the consumed resource is downstream of the API rather than the API itself.
+From an incident-handling standpoint \cite{nist80061}, the detection subsystem
+supports the \emph{detection and analysis} phase and the live defense toggles support
+\emph{containment}.
+
+\begin{table}[t]
+\centering
+\caption{Mapping of the cache-stampede IDDoS to threat-modeling frameworks.}
+\label{tab:frameworks}
+\small
+\begin{tabularx}{\linewidth}{@{}L{3.2cm}L{4.4cm}Y@{}}
+\toprule
+Framework & Category & Remark \\
+\midrule
+STRIDE \cite{shostack2014} & Denial of Service & No spoofing, tampering, disclosure, or elevation needed \\
+MITRE ATT\&CK \cite{mitret1499} & T1499 Endpoint DoS (Application / Service Exhaustion Flood) & Exhausts the database connection pool via the application \\
+OWASP API Top 10 (2023) \cite{owaspapi2023} & API4: Unrestricted Resource Consumption & Resource consumed is downstream (database), not the API process \\
+NIST SP 800-61 \cite{nist80061} & Detection \& analysis; containment & Rule/ML alerts; live defense toggles \\
+DDoS taxonomy \cite{mirkovic2004} & Application-layer, semantic, non-spoofed & Attack rate can be modest; impact is amplified internally \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{An Analytical Model of the Testbed}
+\label{sec:model}
+We now derive simple predictions for the testbed's behavior from its parameters
+(Table~\ref{tab:params} in Section~\ref{sec:design}). The notation is: $K=100$ products,
+TTL $T=4$~s, simulated query time $d_0=0.11$~s, pool size $c=12$, attack burst size
+$B=250$, hot-key pool $H=20$, and request rate $\lambda$.
+
+\paragraph{Effective normal request rate.} The normal-traffic generator issues
+batches of four concurrent requests and then sleeps $0.1$~s. Its rate is therefore
+not the configured nominal value but
+$\lambda \approx 4/(0.1 + \ell_{\max})$, where $\ell_{\max}$ is the slowest response in
+the batch. With $\ell_{\max}\approx0.12$~s this gives $\lambda\approx18$~req/s,
+matching the measured median of 17--18~req/s (Section~\ref{sec:baseline}).
+
+\paragraph{Baseline database load.} Under normal traffic each of the $K$ keys receives
+requests at rate $\lambda/K$, approximately Poisson because product ids are drawn
+uniformly at random. After a miss refills a key, the key stays fresh for $T$; the next
+request after that is a miss. The expected cycle between misses for one key is
+therefore $T + K/\lambda$, and the aggregate database rate and miss ratio are
+\begin{equation}
+q_{\mathrm{base}} = \frac{K}{T + K/\lambda}, \qquad
+m_{\mathrm{base}} = \frac{q_{\mathrm{base}}}{\lambda} = \frac{1}{1+\lambda T/K}.
+\label{eq:baseline}
+\end{equation}
+For $\lambda=17$~req/s these give $q_{\mathrm{base}}=10.1$~queries/s and
+$m_{\mathrm{base}}=0.60$. A consequence that later proves important is that, with a
+short TTL and a uniform catalog, \emph{the normal miss ratio is already high}: most
+normal requests are misses because most keys are cold most of the time.
+
+\paragraph{Undefended attack.} A burst of $B$ concurrent requests for an expired key
+produces up to $B$ misses. The burst cycle time $\tau_b$ (time for the burst to
+complete plus a 50~ms pause) is of the order of the per-request latency under load; at
+a measured attack request rate of ${\approx}250$~req/s with $B=250$, $\tau_b\approx1$~s.
+Each hot key is therefore revisited every $H\tau_b\approx20$~s, which is much longer
+than $T=4$~s, so \emph{every} burst lands on an expired entry. The offered rate of
+database attempts is bounded above by the attack request rate, while the nominal pool
+capacity, from Eq.~\eqref{eq:capacity}, is
+\begin{equation}
+\mu_{\max} = c/d_0 = 12/0.11 \approx 109~\text{queries/s}.
+\label{eq:mu}
+\end{equation}
+The model predicts overload whenever the attempt rate exceeds $\mu_{\max}$, and, for a
+fail-fast pool, predicts that the excess appears as immediate HTTP~503 failures rather
+than as queueing delay. Section~\ref{sec:mechanics} shows that the real system
+saturates much earlier than Eq.~\eqref{eq:mu} suggests.
+
+\paragraph{Defended attack.} With single-flight locking, at most one regeneration per
+key can be in progress, and while a fresh entry exists none is needed. The database
+rate caused by hot keys is therefore bounded by one query per key per TTL,
+\begin{equation}
+q_{\mathrm{hot}} \le \frac{H}{T} = \frac{20}{4} = 5~\text{queries/s},
+\label{eq:defended}
+\end{equation}
+independently of $B$, and the total across the whole catalog is bounded by
+$K/T=25$~queries/s. The edge limiter additionally caps the request rate reaching the
+application from one source address at its configured rate $r=50$~req/s plus a burst
+allowance of 20. The model thus predicts a defended database load of a few queries per
+second, a backend request rate pinned at ${\approx}50$~req/s, and a \emph{coalescing
+ratio}---cache misses per database query---well above one.
+
+\paragraph{Amplification.} We define the stampede amplification of an expiry event as
+the number of database queries it causes, $A=Q_{\mathrm{exp}}$. Undefended, $A$ is
+bounded only by the burst size ($A\le B=250$); defended, $A=1$. The attacker's leverage
+is the ratio of database work caused to requests sent. Section~\ref{sec:results}
+reports both quantities as measured.

@@ -1,0 +1,588 @@
+\documentclass[conference]{IEEEtran}
+
+% ---- packages ----
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+
+% nicer column type for wrapping text in tables
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+
+\begin{document}
+
+\title{CacheCollapse: Reproducing, Detecting, and Mitigating\\
+Cache-Stampede-Driven Indirect Denial of Service in\\
+Containerized Web Applications}
+
+\author{
+\IEEEauthorblockN{Manal Aamir, Tayyaba Arshad, Noor Afza, Batool Fatima, Aun Zaidi}
+\IEEEauthorblockA{Department of Software Engineering\\
+NED University of Engineering and Technology, Karachi, Pakistan\\
+SE-401 Information Security (Complex Engineering Problem), Spring 2026\\
+\{SE-23070, SE-23073, SE-23075, SE-23076, SE-23095\}}
+}
+
+\maketitle
+
+\begin{abstract}
+Containerized web applications almost universally place an in-memory cache between
+a stateless application tier and a relational database to absorb read traffic. This
+design is efficient under steady load, but it hides a structural availability
+weakness: when a popular cache entry expires, a burst of otherwise legitimate
+concurrent requests misses the cache simultaneously and is forwarded, unthrottled,
+to the database. The resulting \emph{cache stampede} (also called dog-piling or the
+thundering-herd problem) converts a modest amount of normal-looking traffic into a
+flood of redundant database queries. Because the attacker never contacts the
+database directly and never violates any application-level rule, the event is an
+\emph{Indirect Distributed Denial of Service} (IDDoS) that volume-based network
+defenses do not catch. This paper presents \textbf{CacheCollapse}, a fully
+containerized testbed and defense framework that (i)~reproduces the cache-stampede
+IDDoS deterministically on a nine-container Docker Compose stack of
+industry-standard services, (ii)~detects it in real time using an explainable
+multi-signal \emph{rule-based} detector and an unsupervised \emph{IsolationForest}
+machine-learning detector trained only on normal traffic, and (iii)~mitigates it
+with a layered defense combining \emph{cache locking} (single-flight regeneration
+with stale-while-revalidate), \emph{application-layer rate limiting}, and \emph{edge
+rate limiting} at the reverse proxy. Across a three-experiment protocol, an
+undefended attack drove database load from ${\sim}15$ to a peak of ${\sim}230$
+queries/s, raised average response time from ${\sim}130$~ms to ${\sim}700$~ms, and
+produced up to ${\sim}180$ failed requests/s, while both detectors fired. With the
+layered defense enabled, database load fell by roughly \textbf{25$\times$} (to
+${\sim}8$ queries/s), failed requests dropped to zero, and customer-visible latency
+on a demonstration storefront fell to ${\sim}80$~ms. An ablation shows that cache
+locking alone protects the database but not the proxy connection path, and that
+edge rate limiting is required to keep legitimate users fast during the attack.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Cache stampede, thundering herd, indirect denial of service, application-layer
+DDoS, containerized security, rate limiting, cache locking, anomaly detection,
+isolation forest, availability.
+\end{IEEEkeywords}
+
+\section*{Highlights}
+\begin{itemize}
+\item A reproducible nine-container Docker Compose testbed turns an ordinary
+Nginx--Flask--Redis--PostgreSQL stack into a controllable cache-stampede IDDoS
+laboratory; an undefended attack raised peak database load ${\sim}15\times$ and
+produced up to ${\sim}180$ failed requests/s from legitimate-looking traffic.
+\item A multi-signal rule-based detector and an unsupervised IsolationForest
+detector trained only on baseline traffic both identified the attack; a side-by-side
+comparison quantifies their trade-offs in training cost, false alarms, and
+interpretability.
+\item A layered mitigation of cache locking with stale-while-revalidate, application
+rate limiting, and edge rate limiting reduced database query load under attack by
+${\sim}25\times$ and restored failed requests to zero.
+\item An ablation isolates a deployment-critical result: cache locking protects the
+database but not the proxy, so \emph{edge} rate limiting is necessary to keep
+legitimate users responsive during the flood.
+\end{itemize}
+
+\section{Introduction}
+The availability of a web service is as much a security property as its
+confidentiality or integrity. Denial-of-service attacks remain among the most common
+and damaging threats to online systems, and the community has produced extensive
+taxonomies and defenses for network- and transport-layer flooding
+\cite{mirkovic2004,zargar2013}. A harder class operates at the application layer: the
+adversary issues syntactically and semantically valid requests that are individually
+indistinguishable from legitimate traffic, so purely volume- or signature-based
+filters are ineffective \cite{praseed2019,xie2009}. This paper studies a particularly
+subtle member of that class in the setting most modern software is deployed in---the
+containerized, multi-service web application.
+
+Virtually every read-heavy web application interposes an in-memory cache, such as
+Redis, between its application tier and its database, so that repeated requests for
+the same object are answered from memory. The entry is given a time-to-live (TTL),
+after which it expires and must be regenerated from the database. If a popular
+(``hot'') key expires while many requests for it are in flight, all of them miss the
+cache at the same instant and are forwarded to the database simultaneously. A single
+expiry thus produces not one query but $N$ redundant queries, where $N$ is the
+instantaneous concurrency on that key. This is a \emph{cache stampede},
+\emph{dog-pile}, or \emph{thundering herd}, documented as a performance hazard in
+large-scale systems \cite{vattani2015,nishtala2013}.
+
+What is less often treated is that the same mechanism is a \emph{security}
+vulnerability. An adversary who understands a target's caching behavior can
+deliberately align a burst of requests for a single hot object with that object's
+expiry, repeatedly, so the database is driven into overload by traffic that never
+leaves the normal request distribution of the application. The database---not the web
+server---is the victim, and the web application is merely the conduit. We call this an
+\emph{Indirect Distributed Denial of Service} (IDDoS): indirect because the attacker
+never addresses the victim component directly, and distributed because the
+amplification is produced by the fan-out of concurrency rather than by the attacker's
+own request volume. Because the attack rides on legitimate application logic rather
+than a software defect, it cannot be patched away; it must be \emph{detected} and
+\emph{mitigated} as an operational property of the system.
+
+\subsection{Problem Statement and the Complex Engineering Challenge}
+Defending this vulnerability in a containerized environment is a genuine
+complex-engineering problem because its difficulty arises from the \emph{interaction}
+of well-understood components rather than from any single exotic one. Three tensions
+must be resolved simultaneously:
+\begin{itemize}
+\item \textbf{Detection without a volumetric signature.} The attack's request rate at
+the web tier can be indistinguishable from a legitimate spike or flash crowd
+\cite{xie2009}. A detector keyed on request volume alone will either miss the attack
+or raise constant false alarms on benign bursts.
+\item \textbf{Mitigation without denying service to legitimate users.} A defense that
+simply rejects traffic to protect the database can itself become the denial of
+service. The mitigation must shed the \emph{redundant} load while continuing to serve
+genuine users quickly.
+\item \textbf{Faithful, safe, repeatable experimentation.} Studying an availability
+attack requires driving a realistic system into failure repeatedly and measuring
+per-component behavior, which demands an isolated, resettable, production-like
+environment rather than a single-process simulation.
+\end{itemize}
+These requirements are coupled: an overly aggressive guardrail degrades legitimate
+users, while a cache-only fix that ignores the connection path leaves users slow even
+when the database is healthy (Section~\ref{sec:results}). Resolving the problem
+requires an integrated architectural and algorithmic design, not merely a faster
+database or a bigger cache.
+
+\subsection{Proposed Solution}
+We present \textbf{CacheCollapse}, a framework addressing all three dimensions
+together: (i)~a \emph{reproducible containerized testbed} that reconstructs the
+Nginx $\rightarrow$ Flask $\rightarrow$ Redis $\rightarrow$ PostgreSQL request path on
+an isolated Docker Compose network and generates both normal traffic and a
+controllable stampede attack; (ii)~a \emph{dual detection subsystem} pairing an
+explainable multi-signal rule with an unsupervised IsolationForest model trained only
+on baseline behavior; and (iii)~a \emph{layered mitigation} combining single-flight
+cache locking with stale-while-revalidate, an application-layer per-client rate
+limiter, and an edge rate limiter at the reverse proxy that can be toggled live.
+
+\subsection{Contributions}
+\begin{itemize}
+\item A \textbf{containerized IDDoS testbed} that reproduces the cache-stampede attack
+deterministically on nine interacting industry-standard services, with a control
+plane that switches traffic, attack, and each defense on and off live.
+\item A \textbf{multi-signal rule-based detector} that fires only when elevated
+database load, elevated latency, and an elevated cache-miss rate coincide, with
+cold-cache warm-up suppression that eliminates start-up false alarms.
+\item An \textbf{unsupervised IsolationForest detector} trained exclusively on
+normal-baseline traffic with standardized features, and a controlled comparison of
+the two detectors on training cost, responsiveness, false alarms, and
+interpretability.
+\item A \textbf{layered mitigation} and an \textbf{ablation} isolating each
+mechanism's contribution, including the deployment-critical finding that
+database-level and proxy-level protection are distinct and both required.
+\item A fully \textbf{reproducible, instrumented deployment} (single
+\texttt{docker compose up}, Prometheus/Grafana, live dashboard, demonstration
+storefront) validated by a 16-case automated test suite.
+\end{itemize}
+
+\section{Literature Review}
+\subsection{Cache Stampede and the Thundering Herd}
+Nishtala et al., describing Facebook's memcache deployment, document ``stale sets''
+and ``thundering herds'' as first-order concerns and introduce \emph{leases}---per-key
+tokens that permit only one client to regenerate a missing value while others briefly
+wait---reporting a large reduction in peak database query rate \cite{nishtala2013}.
+Vattani, Chierichetti, and Lowenstein formalize the mitigation side, deriving
+theoretically optimal \emph{probabilistic early recomputation} (XFetch), in which an
+item is refreshed slightly before its TTL with a probability that rises as expiry
+approaches \cite{vattani2015}. Both treat the stampede as a performance hazard.
+CacheCollapse builds on their mitigation insights---single-flight regeneration is the
+security-hardened descendant of memcache leases---but reframes the stampede as an
+\emph{attacker-triggerable} availability vulnerability and adds detection and
+operational defense.
+
+\subsection{Denial of Service and Application-Layer Attacks}
+Classical DDoS research classifies attacks and defenses mainly at the network and
+transport layers. Mirkovic and Reiher give the canonical taxonomy \cite{mirkovic2004},
+and Zargar et al. survey flooding defenses, stressing that protection must span
+prevention, detection, and response \cite{zargar2013}. Application-layer DoS is a
+distinct, harder problem: Xie and Yu model normal browsing to detect app-layer attacks
+using ordinary HTTP GET requests \cite{xie2009}, and Praseed and Thilagam survey the
+space, noting such attacks can be mounted at low volume with legitimate requests
+\cite{praseed2019}. The cache-stampede IDDoS is an extreme point: not only are the
+requests legitimate, the \emph{aggregate} web-tier rate need not be anomalous---the
+damage is produced downstream by cache semantics.
+
+\subsection{Availability Attacks in Containerized Environments}
+Containers are the dominant packaging and orchestration unit for modern applications
+\cite{pahl2015,merkel2014}, with cluster managers such as Kubernetes tracing their
+lineage to internal systems like Borg and Omega \cite{burns2016}, and the microservice
+style decomposing applications into interacting services \cite{dragoni2017}. Security
+analyses of Docker catalog isolation and configuration weaknesses
+\cite{combe2016,sultan2019}, but availability has received comparatively less
+attention. A directly relevant example is the \emph{Yo-Yo attack}, in which periodic
+bursts drive an auto-scaling controller to oscillate, degrading performance and
+inflating cost while evading simple volume detection \cite{sides2016}. CacheCollapse
+is complementary: like Yo-Yo it exploits an emergent property of a cloud-native
+pattern (there, elasticity; here, caching) using legitimate-looking traffic, and must
+be studied in an orchestrated, resettable environment.
+
+\subsection{Detection: Rule-Based and Machine-Learning Anomaly Detection}
+Anomaly detection is the natural framing for an attack with no fixed signature.
+Chandola et al. organize the field by technique and assumption, underlining that
+detector choice depends on label availability and interpretability requirements
+\cite{chandola2009}. Among unsupervised methods, the IsolationForest of Liu, Ting, and
+Zhou isolates anomalies directly with randomized trees, has near-linear complexity,
+needs no labels, and performs well with small samples \cite{liu2008}; we use its
+scikit-learn implementation \cite{pedregosa2011}. CacheCollapse deliberately pairs an
+unsupervised model with an explainable rule because the two occupy different points
+in the design space \cite{chandola2009}.
+
+\subsection{Mitigation: Rate Limiting and Request Coalescing}
+Raghavan et al. study distributed rate limiting that enforces a global aggregate limit
+while preserving fair flow behavior \cite{raghavan2007}, and production proxies expose
+mature local limiters---Nginx's \texttt{limit\_req} implements a leaky-bucket limiter
+keyed on client address \cite{nginxlimitreq}. Request coalescing is realized through
+Redis TTLs and \texttt{SET\ldots NX} primitives \cite{redisdocs} and is conceptually
+descended from memcache leases \cite{nishtala2013}; stability-pattern practice further
+recommends serving stale data rather than blocking during regeneration
+\cite{nygard2018}. A contribution of this paper is to show empirically that these
+controls are \emph{not} interchangeable: coalescing protects the database, rate
+limiting protects the request path, and only their combination preserves end-to-end
+availability (Section~\ref{sec:ablation}).
+
+\section{Methodology}
+\subsection{Threat Model and Attack Chain}
+We assume an external adversary who can send ordinary HTTP requests to the public
+endpoint and knows (or can probe) that responses for a set of hot objects are cached
+with a short TTL. The adversary cannot reach the database or cache directly, cannot
+read internal metrics, and issues only well-formed requests. The attack chain is:
+\emph{hot entry expires} $\rightarrow$ \emph{$N$ concurrent requests arrive}
+$\rightarrow$ \emph{$N$ cache misses} $\rightarrow$ \emph{$N$ database queries}
+$\rightarrow$ \emph{overload}.
+
+Let a hot key $k$ have regeneration time $d$. If $N$ requests for $k$ arrive within
+$(t_{\mathrm{exp}}, t_{\mathrm{exp}}+d)$, an unprotected system issues $N$ database
+queries; an ideal single-flight system issues $1$. The ratio $N{:}1$ is the stampede
+amplification, which the attacker maximizes by concentrating requests on hot keys and
+phasing bursts to expiry. Our testbed uses a short TTL and an attacker that rotates
+its burst across a small pool of hot keys, so some key is always expiring.
+
+\subsection{System Architecture}
+CacheCollapse is a nine-service Docker Compose application on one isolated bridge
+network; each service is a separate container so CPU, memory, and I/O can be
+attributed per component and the system reset between runs (Table~\ref{tab:services}).
+The request path is Nginx $\rightarrow$ Flask $\rightarrow$ Redis, with a PostgreSQL
+read only on a cache miss. Redis additionally serves as a lightweight \emph{control
+bus}: the dashboard writes run-state and defense flags that the load generator and
+Flask app read, so every experiment is reproducible from the browser.
+
+\begin{table}[t]
+\centering
+\caption{CacheCollapse containerized services.}
+\label{tab:services}
+\footnotesize
+\begin{tabular}{@{}cL{1.3cm}L{4.8cm}@{}}
+\toprule
+\# & Service & Role \\
+\midrule
+1 & Nginx & Public reverse proxy; edge (\texttt{limit\_req}) rate limiting \\
+2 & Flask app & \texttt{GET /products/<id>}; cache locking + app rate limiting \\
+3 & Redis & Cache (short TTL) and shared control bus \\
+4 & PostgreSQL & Victim database; 100 seeded product records \\
+5 & Load gen. & Asynchronous normal traffic and the burst attack \\
+6 & Monitor & Per-second metrics, rule + ML detection, CSV log, live feed \\
+7 & Frontend & Live dashboard and demonstration storefront \\
+8 & Prometheus & Time-series metrics collection \\
+9 & Grafana & Standard dashboards over Prometheus \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Attack and Normal-Traffic Generation}
+The load generator reads two flags from the control bus. With \emph{normal traffic}
+on, it issues a steady, low-rate stream spread across the catalog, representing a
+benign population whose requests mostly hit the cache. With \emph{attack} on, it
+issues large concurrent bursts aimed at a small pool of hot keys, rotating the target
+between bursts so the pool continuously cycles through expiry. This rotation converts
+an isolated, one-shot stampede into a \emph{sustained} overload.
+
+\subsection{Instrumentation and Metrics}
+The monitor samples twice per second: it scrapes the Flask app's Prometheus metrics,
+computes per-interval rates, runs both detectors, appends a CSV row, and streams the
+result to the dashboard over Server-Sent Events. Measured quantities are requests/s,
+database queries/s, cache hits/misses (and the miss rate $m=\text{misses}/(\text{hits}
++\text{misses})$), average and p95 response time, failed requests/s, and per-container
+CPU and memory. Two timings are recorded per attack: \emph{detect time} (onset to
+first alert) and \emph{recover time} (defense activation to healthy state). Failures
+are split into \texttt{HTTP 503} (genuine overload) and \texttt{HTTP 429}
+(intentional shedding by the rate limiter); only the former count as availability
+failures, so an active defense is not mis-scored as an outage.
+
+\subsection{Rule-Based Detector}
+The rule encodes the attack's multi-signal signature, firing only when elevated
+database load, latency, and cache-miss rate hold simultaneously:
+\begin{equation}
+\mathrm{alert} \iff
+(q_{db} > K\,\bar{q}_{\mathrm{base}}) \wedge
+(\bar{L} > \tau_L) \wedge
+(m > \tau_m),
+\label{eq:rule}
+\end{equation}
+where $q_{db}$ is database queries/s, $\bar{q}_{\mathrm{base}}$ a learned baseline,
+$\bar{L}$ average response time, and $m$ the cache-miss rate; we use $K=5$,
+$\tau_L=200$~ms, $\tau_m=0.5$. Requiring all three conditions distinguishes an attack
+from a benign flash crowd: a legitimate spike raises request volume but is served
+from cache, so it does not simultaneously raise database load and the miss rate. A
+cold-cache warm-up suppression disables alerting during the first few seconds after
+traffic starts, and $\bar{q}_{\mathrm{base}}$ is learned online from steady traffic.
+
+\subsection{Machine-Learning Detector}
+The ML detector is an unsupervised IsolationForest \cite{liu2008,pedregosa2011} trained
+only on normal traffic---no attack samples and no labels. Each sample is
+$\mathbf{x}=[\,q_{db}, \bar{L}, m, \text{req/s}, \text{failed/s}\,]$. Because features
+span different scales, they are standardized to zero mean and unit variance using
+baseline statistics before the forest is fit; live samples are standardized with the
+same statistics and scored, and a sample flagged as an outlier by the forest's
+decision function is an anomaly. The model trains only after a short warm-up, and an
+alert must persist for two consecutive samples (debounce), removing single-interval
+blips while leaving a sustained attack easily detectable.
+
+\subsection{Mitigation I---Cache Locking with Stale-While-Revalidate}
+On a miss for key $k$, the Flask app attempts a short-lived mutex via
+\texttt{SET lock:}$k$\texttt{ 1 NX PX T}. The single winner queries the database and
+writes a \emph{fresh} copy under the normal TTL and a \emph{stale} copy under a much
+longer TTL. Every other concurrent miss immediately returns the stale copy. Thus $N$
+simultaneous misses produce exactly \emph{one} database query, and losers are served
+in cache time rather than waiting for regeneration. A stale copy is pre-warmed for
+every key at start-up so the defense is instant even if an attack begins before any
+value is cached---the security-oriented generalization of memcache leases
+\cite{nishtala2013} and of stale-serving stability practice \cite{nygard2018}.
+
+\subsection{Mitigation II---Layered Rate Limiting}
+Rate limiting sheds the attacker's excess concurrency at two layers. The
+\emph{application layer} enforces a per-client, per-second cap inside Flask using
+Redis counters, returning \texttt{HTTP 429} to excess requests; running behind the
+proxy, it is toggled live without a reload. The \emph{edge layer} uses Nginx's
+leaky-bucket \texttt{limit\_req} keyed on client address \cite{nginxlimitreq}; when
+enabled, the monitor rewrites a small included configuration fragment and triggers an
+Nginx reload, so the flood is rejected at the proxy before it consumes application or
+connection resources. The proxy forwards the real client address to the application
+so the per-client limiter buckets the attacker and a genuine user separately.
+
+\subsection{Experimental Protocol}
+Experiments follow a three-condition protocol executed from the dashboard:
+\textbf{E1---Baseline} (normal traffic only); \textbf{E2---Attack, undefended};
+and \textbf{E3---Attack, defended} (cache locking, application rate limiting, and edge
+rate limiting enabled). Each condition is sampled for a fixed window, and all metrics
+are logged. A demonstration storefront (``CacheShop'') that loads hot products and
+reports per-item load time provides a customer's-eye view of availability. All
+experiments ran on a single host under Docker Desktop (Docker~29.x).
+
+\section{Results and Analysis}
+\label{sec:results}
+\subsection{Setup}
+The database was seeded with 100 records; a short TTL and a rotating-hot-key attacker
+were used so stampedes recur and overload is sustained. Reported figures are
+representative values from the logs; peaks and interval averages are distinguished
+where relevant.
+
+\subsection{Cache Behavior (Sanity Check)}
+The first request for a product is answered from the database in ${\sim}180$~ms, and
+the immediately following request for the same product is answered from Redis in
+${\sim}12$~ms---a ${\sim}15\times$ speed-up confirming the cache is the component
+under contention during a stampede.
+
+\subsection{Three-Experiment Comparison}
+Table~\ref{tab:three} summarizes the conditions. Under the undefended attack (E2),
+database load rose from ${\sim}15$ to a peak of ${\sim}230$ queries/s, average
+response time from ${\sim}130$~ms to ${\sim}700$~ms, the miss rate toward ${\sim}0.88$,
+and up to ${\sim}180$ requests/s failed with \texttt{HTTP 503}---a clear overload from
+legitimate-looking requests. With the layered defense (E3), database load fell to
+${\sim}8$ queries/s (a ${\sim}25\times$ reduction), response time to ${\sim}90$~ms, and
+\texttt{503} failures to zero.
+
+\begin{table}[t]
+\centering
+\caption{Three-experiment comparison (representative values).}
+\label{tab:three}
+\footnotesize
+\begin{tabular}{@{}L{2.0cm}cccc@{}}
+\toprule
+Condition & DB q/s (pk) & Resp. (pk) & Fail/s & Status \\
+\midrule
+E1 Baseline & ${\sim}15$ & ${\sim}130$~ms & 0 & Healthy \\
+E2 Undefended & ${\sim}230$ & ${\sim}700$~ms & ${\sim}180$ & Overloaded \\
+E3 Defended & ${\sim}8$ & ${\sim}90$~ms & 0 & Protected \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Detection: Rule-Based vs. Machine-Learning}
+Both detectors identified the attack in E2 and stayed silent in E1
+(Table~\ref{tab:detectors}). The rule requires no training, is immediately available,
+is fully interpretable (an alert names which conditions held), and did not fire on
+calm traffic; but because the attack is bursty, the three conditions align only
+intermittently, so the rule fires on a subset of attack intervals. The IsolationForest,
+once trained on a short baseline, fired on essentially every attack interval,
+providing denser, faster confirmation, at the cost of requiring a clean training
+window and offering less transparent justification. Used together, the rule explains
+\emph{why} an alert occurred while the forest provides continuous confirmation.
+
+\begin{table}[t]
+\centering
+\caption{Detector comparison.}
+\label{tab:detectors}
+\footnotesize
+\begin{tabular}{@{}L{2.5cm}L{2.3cm}L{2.3cm}@{}}
+\toprule
+Property & Rule-based & IsolationForest \\
+\midrule
+Training data & None & Baseline only \\
+Availability & Immediate & After warm-up \\
+Baseline false alarms & None & Rare (debounced) \\
+Attack-interval coverage & Intermittent & Dense \\
+Interpretability & High & Low \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Mitigation Ablation}
+\label{sec:ablation}
+An ablation isolates each defense (Table~\ref{tab:ablation}) and yields the paper's
+central deployment finding. Cache locking alone \emph{protects the database}---query
+load drops to single digits because $N$ misses are coalesced to one---but does not by
+itself keep users fast: with only application-layer controls, the attacker's flood
+still congests the reverse proxy and connection path, so the storefront remained slow
+even though the database was healthy. Stale-while-revalidate removed the regeneration
+queue; edge rate limiting removed the remaining congestion by rejecting the flood at
+the proxy, and only then did storefront latency fall to ${\sim}80$~ms. Database
+protection and request-path protection are thus distinct problems requiring distinct
+controls.
+
+\begin{table}[t]
+\centering
+\caption{Mitigation ablation (customer-visible behavior under attack).}
+\label{tab:ablation}
+\footnotesize
+\begin{tabular}{@{}L{2.4cm}L{1.7cm}L{1.6cm}L{1.4cm}@{}}
+\toprule
+Configuration & DB load & Storefront & Avail. \\
+\midrule
+No defense & Overloaded & Fails/slow & Denied \\
+Cache lock only & Protected & Still slow & Degraded \\
++ Stale-while-reval. & Protected & Improved & Degraded \\
++ Edge rate limit & Protected & ${\sim}80$~ms & Preserved \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Recovery and Rate-Limiting Layers}
+When defenses are enabled during an ongoing attack, the system returns to a healthy
+state within ${\sim}1.5$--$2.5$~s, because cache locking immediately collapses the
+redundant queries and the pre-warmed stale cache serves losers without waiting.
+Isolating the rate-limiting layers confirms they protect different things:
+application-layer limiting sheds excess \emph{database} work (returning \texttt{429}
+rather than touching the database) but does not relieve proxy congestion, whereas edge
+\texttt{limit\_req} rejects the flood at the proxy and brings storefront latency down
+by roughly an order of magnitude---the empirical basis for recommending edge rate
+limiting, not application limiting alone.
+
+\subsection{End-to-End Validation}
+A 16-case automated test suite exercised against the live stack checks service health
+and routing, cache behavior, the calm baseline (no false alarms), the undefended
+attack (overload with both detectors firing), each mitigation, recovery after the
+attack stops, and the live-feed rate. All 16 cases pass, providing repeatable evidence
+for the results above.
+
+\section{Comparative Analysis}
+CacheCollapse integrates concerns that prior work addresses only in part
+(Table~\ref{tab:capability}). Performance-oriented stampede work
+\cite{vattani2015,nishtala2013} contributes coalescing but no attacker model,
+detection, or testbed. Application-layer DDoS work \cite{praseed2019,xie2009}
+contributes detection but neither the cache-specific mechanism nor a reproducible
+container environment. Container-security work \cite{combe2016,sultan2019} catalogs
+weaknesses without instrumenting a specific availability attack end to end. The Yo-Yo
+attack \cite{sides2016} is closest in spirit but targets elasticity rather than caching
+and does not combine detection with layered mitigation. CacheCollapse is the only one
+of these to address all four dimensions together.
+
+\begin{table}[t]
+\centering
+\caption{Capability coverage. \checkmark~= addressed; $\sim$~= partial; $\times$~= not addressed.}
+\label{tab:capability}
+\footnotesize
+\begin{tabular}{@{}L{2.9cm}cccc@{}}
+\toprule
+Work & Testbed & Detect & Layered mit. & Containerized \\
+\midrule
+Prob. prevention \cite{vattani2015} & $\times$ & $\times$ & $\sim$ & $\times$ \\
+Memcache leases \cite{nishtala2013} & $\times$ & $\times$ & $\sim$ & $\times$ \\
+App-layer DDoS \cite{praseed2019,xie2009} & $\times$ & \checkmark & $\times$ & $\times$ \\
+DDoS surveys \cite{mirkovic2004,zargar2013} & $\times$ & $\sim$ & $\sim$ & $\times$ \\
+Container security \cite{combe2016,sultan2019} & $\times$ & $\times$ & $\times$ & $\sim$ \\
+Yo-Yo attack \cite{sides2016} & $\sim$ & $\sim$ & $\times$ & \checkmark \\
+\textbf{CacheCollapse} & \checkmark & \checkmark & \checkmark & \checkmark \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Discussion}
+\subsection{Why a Layered Defense Is Necessary}
+No single control is sufficient. Cache locking is the only mechanism that addresses the
+root cause---it restores the $N{:}1$ query ratio to $1{:}1$---but operates below the
+proxy and cannot relieve edge congestion. Rate limiting relieves that congestion but,
+applied only at the application layer, acts too late in the path; applied at the edge
+it protects the proxy but does not fix the redundant-query amplification if a limiter
+is tuned permissively. The correct design composes them: edge limiting caps the flood,
+cache locking coalesces the surviving misses, and stale-while-revalidate serves the
+coalesced waiters without delay---mirroring the prevention--detection--response framing
+urged for DDoS defense \cite{zargar2013}.
+
+\subsection{Rules vs. Machine Learning}
+The comparison argues against treating the detectors as substitutes. The rule is the
+better \emph{first} line (immediate, interpretable, free of training and false-alarm
+risk on benign spikes); the forest is the better \emph{continuous} confirmation (dense
+firing, adaptive to baseline). Their weaknesses are complementary, which is why
+deploying both is preferable to choosing one \cite{chandola2009}.
+
+\subsection{Deployment Implications}
+For operators of cached, containerized web services: enable single-flight regeneration
+with a stale-serving fallback on hot keys; rate-limit at the edge, not only in the
+application; forward real client identity so per-client limits are meaningful; and
+monitor database load, latency, and cache-miss rate \emph{together}, since any one
+alone is an unreliable alarm. All are realizable with standard components---Redis,
+Nginx, and a reverse proxy.
+
+\subsection{Limitations}
+The testbed runs on a single host under Docker Desktop, whose port-forwarding adds some
+latency under heavy connection load, so absolute latency figures are
+environment-dependent while the \emph{relative} effects are robust. The normal
+population and attacker are synthetic; validating against production traces would
+strengthen the evaluation. The IsolationForest requires a clean baseline window, so a
+system attacked from start-up would train on contaminated data; the always-available
+rule mitigates but does not eliminate this. Finally, thresholds ($K$, $\tau_L$,
+$\tau_m$, limiter rates) were tuned on the testbed and need site-specific calibration.
+
+\section{Conclusion}
+CacheCollapse is a reproducible containerized framework for studying and defending the
+cache-stampede IDDoS---an availability attack in which legitimate-looking requests,
+aligned with cache expiry, overload a database through the application rather than
+attacking it directly. On a nine-container stack, an undefended attack raised peak
+database load roughly $15\times$, pushed average response time from ${\sim}130$~ms to
+${\sim}700$~ms, and produced up to ${\sim}180$ failed requests/s. A multi-signal rule
+and an unsupervised IsolationForest each identified the attack while remaining silent
+on benign traffic, and their comparison clarified a real trade-off between
+interpretability and continuous sensitivity. A layered mitigation reduced database
+query load by roughly $25\times$, eliminated \texttt{503} failures, and restored fast
+response, recovering within a couple of seconds; an ablation established that
+database-level coalescing and edge-level rate limiting protect different parts of the
+system and are both required. Future work will replay production traces, extend the
+testbed to multi-node Kubernetes to study interaction with auto-scaling attacks such
+as Yo-Yo \cite{sides2016}, add probabilistic early recomputation \cite{vattani2015} as
+a proactive complement, and automate threshold calibration.
+
+\section*{CRediT Authorship Contribution Statement}
+\textbf{Manal Aamir:} Conceptualization, Methodology, Writing -- Review and Editing.
+\textbf{Tayyaba Arshad:} Investigation, Validation, Data Curation.
+\textbf{Noor Afza:} Software (load generation and monitoring), Visualization.
+\textbf{Batool Fatima:} Software (detection and mitigation), Validation.
+\textbf{Aun Zaidi:} Conceptualization, Methodology, Software (system integration),
+Writing -- Original Draft.
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}

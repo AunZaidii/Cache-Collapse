@@ -1,0 +1,58 @@
+%% =====================================================================
+\section{Conclusion and Future Work}
+\label{sec:conclusion}
+%% =====================================================================
+
+CacheCollapse is a reproducible containerized framework for studying and defending
+the cache-stampede indirect denial of service---an availability attack in which
+well-formed requests, aligned with cache expiry, overload a database through the
+application rather than by attacking it directly. We revisit the four research
+questions.
+
+\textbf{RQ1 (Reproduction).} On a nine-container Nginx--Flask--Redis--PostgreSQL stack,
+an attacker rotating 250-request bursts across 20 hot products raised the median rate
+of database query attempts from 11 to 108 per second (peak 317), more than doubled
+median latency (77 to 174~ms, peak 1.16~s), and produced HTTP~503 failures in 80\% of
+sampling intervals, at a median of 84 failures per second.
+
+\textbf{RQ2 (Mechanism).} A simple model predicts the baseline database load to within
+9\% from the catalog size, TTL, and request rate, and explains why the normal miss
+ratio is already high under short TTLs. Under attack, a fail-fast connection pool and
+failed regenerations that never fill the cache combine into goodput collapse:
+completed database work stays near 23 queries per second---about one fifth of the
+pool's nominal capacity---while every additional attempt fails.
+
+\textbf{RQ3 (Detection).} The multi-signal rule detected 11 of 12 attack episodes with
+perfect precision and a median latency of 3.2~s; the IsolationForest detected 10 of 12
+with a median latency of 0.85~s and interval recall of 0.91. Their union detected all
+12 with a single false alarm in 332 normal intervals. The rule detects harm and is
+silent on high-volume traffic that the cache absorbs (where a volume threshold fires
+97\% of the time); the forest detects novelty, which makes it fast but also makes it
+flag idleness. Threshold analysis shows the deployed rule is conservative and could
+roughly double its recall at a small false-alarm cost, and that its cache-miss
+condition is a weak signal that should be replaced by direct measures of database
+harm.
+
+\textbf{RQ4 (Mitigation).} Cache locking with stale-while-revalidate plus application
+and edge rate limiting reduced median database load 18-fold (95\% CI 16.8--19.2) to
+6 queries per second, cut median latency 6.4-fold to 27~ms, effectively eliminated
+failures, held for 4.5~hours of continuous attack, and restored health a median of
+1.35~s after being enabled mid-attack. The ablation and the longitudinal analysis of
+14 sessions establish that database-level coalescing and edge-level rate limiting
+protect different parts of the system and are both required.
+
+\paragraph{Future work.} Several directions follow naturally. (1)~\emph{Realistic
+workloads}: replay production-like traces with Zipf-distributed popularity and
+measure how skew changes both the stampede and the miss-ratio signal. (2)~\emph{Distributed
+attackers}: generate attack traffic from many addresses and evaluate aggregate,
+behavioral, and adaptive admission control \cite{welsh2003,ranjan2009} in place of
+per-address limits. (3)~\emph{Orchestrated deployments}: extend the testbed to
+multi-node Kubernetes with replicated caches and auto-scaling, to study interactions
+with Yo-Yo-style attacks \cite{sides2016,bremlerbarr2017}. (4)~\emph{Proactive
+mitigation}: add probabilistic early recomputation \cite{vattani2015} and token-checked
+leases \cite{kleppmann2016} and compare them with the current reactive locking.
+(5)~\emph{Better detection}: replace the miss-ratio condition with pool-exhaustion and
+failure signals, calibrate thresholds automatically from a validation window, give the
+forest an explicit no-traffic state, and log the active defense configuration with
+every sample. (6)~\emph{Instrumentation}: add per-container resource metrics (for
+example via cAdvisor) and end-to-end latency measured at the proxy.

@@ -1,0 +1,163 @@
+%% =====================================================================
+\section{Introduction}
+\label{sec:intro}
+%% =====================================================================
+
+The availability of a web service is as much a security property as its
+confidentiality or integrity. Denial-of-service (DoS) attacks remain among the most
+common and most damaging threats to online systems, and the research community has
+produced extensive taxonomies and defenses for network- and transport-layer flooding
+\cite{mirkovic2004,zargar2013}. Large botnets such as Mirai have shown that raw
+volumetric capacity is cheap for an adversary to obtain \cite{antonakakis2017}. A
+harder class of attacks, however, operates at the application layer: the adversary
+issues syntactically and semantically valid requests that are individually
+indistinguishable from those of legitimate users, so that volume- or signature-based
+filters are ineffective or must be tuned so aggressively that they harm real customers
+\cite{praseed2019,xie2009,ranjan2009}. This paper studies a particularly subtle member
+of that class in the setting in which most modern software is now deployed: the
+containerized, multi-service web application.
+
+\subsection{Motivation: the Cache as an Attack Surface}
+Virtually every read-heavy web application interposes an in-memory cache such as
+Redis or memcached between its application tier and its database, so that repeated
+requests for the same object are answered from memory rather than recomputed
+\cite{fitzpatrick2004,nishtala2013}. Each cached entry receives a time-to-live (TTL),
+after which it expires and must be regenerated from the database. The cache is usually
+discussed as a \emph{performance} component, but it also changes the \emph{capacity
+model} of the system: once a cache is in place the database is typically provisioned
+only for the residual miss traffic, not for the full request rate. Production
+workloads are highly skewed towards a small set of popular (``hot'') keys
+\cite{breslau1999,atikoglu2012}, so the protection the cache provides is concentrated
+on exactly those keys.
+
+If a hot key expires while many requests for it are in flight, all of them miss the
+cache at the same instant and are forwarded to the database simultaneously. A single
+expiry therefore produces not one query but $N$ redundant queries, where $N$ is the
+instantaneous concurrency on that key. This is a \emph{cache stampede}, also called a
+\emph{dog-pile} or \emph{thundering herd}, and it is documented as a first-order hazard
+in large-scale systems \cite{vattani2015,nishtala2013}. The consequences can be
+severe even without an adversary: Facebook's widely discussed outage of September 2010
+was attributed to an automated system that, on seeing an invalid cached configuration
+value, caused every client to query the backing database cluster at once, overwhelming
+it in a self-reinforcing loop \cite{johnson2010}. Practitioner guidance on cascading
+failure likewise identifies the loss of a cache layer as one of the classic triggers of
+system-wide overload \cite{beyer2016}.
+
+What is less often treated is that the same mechanism is a \emph{security}
+vulnerability. An adversary who understands a target's caching behavior can
+deliberately align bursts of requests for hot objects with those objects' expiry,
+repeatedly, so that the database is driven into overload by traffic that never leaves
+the normal request distribution of the application. The database---not the web
+server---is the victim, and the web application is merely the conduit. We call this
+an \emph{Indirect Distributed Denial of Service} (IDDoS): \emph{indirect} because the
+attacker never addresses the victim component, and \emph{distributed} in its effect
+because the damage is produced by the fan-out of concurrency inside the system rather
+than by the attacker's own request volume. Because the attack rides on correct
+application logic rather than on a software defect, it cannot be ``patched''; it must
+be \emph{detected} and \emph{mitigated} as an operational property of the system, in
+the same way that algorithmic-complexity attacks exploit legitimate but expensive code
+paths \cite{crosby2003} and low-rate attacks exploit legitimate protocol timers
+\cite{kuzmanovic2003}.
+
+\subsection{Problem Statement and the Complex Engineering Challenge}
+Defending this vulnerability in a containerized environment is a genuine complex
+engineering problem: its difficulty arises from the \emph{interaction} of
+well-understood components rather than from any single exotic one. Three tensions
+must be resolved simultaneously.
+
+\begin{enumerate}[label=\textbf{T\arabic*.},leftmargin=*]
+\item \textbf{Detection without a volumetric signature.} The attack's request rate at
+the web tier can resemble a legitimate spike or flash crowd \cite{jung2002,kandula2005}.
+A detector keyed on request volume alone will either miss the attack or raise
+constant false alarms on benign bursts that the cache absorbs harmlessly.
+\item \textbf{Mitigation without self-inflicted denial of service.} A defense that
+simply rejects traffic to protect the database can itself become the denial of
+service. The mitigation must shed the \emph{redundant} load while continuing to serve
+genuine users quickly.
+\item \textbf{Faithful, safe, repeatable experimentation.} Studying an availability
+attack requires driving a realistic system into failure repeatedly and measuring
+per-component behavior, which demands an isolated, resettable, production-like
+environment rather than a single-process simulation---and one that cannot harm any
+third party.
+\end{enumerate}
+
+These requirements are coupled. An overly aggressive guardrail degrades legitimate
+users; a cache-only fix that ignores the connection path leaves users slow even when
+the database is healthy (Section~\ref{sec:ablation}); and a detector that is evaluated
+only on the traffic it was tuned on can look perfect while measuring the wrong thing
+(Section~\ref{sec:det-results}). Resolving the problem therefore requires an integrated
+architectural, algorithmic, and experimental design, not merely a faster database or a
+larger cache.
+
+\subsection{Research Questions}
+The work is organized around four research questions:
+\begin{description}[leftmargin=1.2em,style=nextline]
+\item[RQ1 (Reproduction).] Can a cache-stampede IDDoS be reproduced deterministically
+on an ordinary containerized stack using only well-formed requests, and what are its
+quantitative effects on database load, latency, and availability?
+\item[RQ2 (Mechanism).] Which mechanism converts the stampede into user-visible failure,
+and can its magnitude be predicted from simple system parameters (key count, TTL,
+request rate, connection-pool size)?
+\item[RQ3 (Detection).] How do an explainable multi-signal rule and an unsupervised
+IsolationForest compare in detection latency, coverage, false alarms, and
+interpretability---and how do they compare with naive single-signal detectors?
+\item[RQ4 (Mitigation).] Which combination of cache locking, stale-while-revalidate,
+and rate limiting restores availability, how quickly, and what does each layer
+contribute?
+\end{description}
+
+\subsection{Proposed Solution}
+We present \textbf{CacheCollapse}, a framework that addresses all three tensions
+together:
+(i)~a \emph{reproducible containerized testbed} that reconstructs the
+Nginx~$\rightarrow$~Flask~$\rightarrow$~Redis~$\rightarrow$~PostgreSQL request path on
+an isolated Docker Compose network \cite{merkel2014,dockercompose} and generates both
+normal traffic and a controllable stampede attack;
+(ii)~a \emph{dual detection subsystem} pairing an explainable multi-signal rule with
+an unsupervised IsolationForest \cite{liu2008,liu2012} trained only on baseline
+behavior; and
+(iii)~a \emph{layered mitigation} combining single-flight cache locking with
+stale-while-revalidate \cite{nishtala2013,rfc5861}, an application-layer per-client
+rate limiter, and an edge rate limiter at the reverse proxy \cite{nginxlimitreq}, each
+of which can be toggled live from a browser dashboard while the attack is running.
+
+\subsection{Contributions}
+\begin{itemize}[leftmargin=*]
+\item A \textbf{containerized IDDoS testbed} that reproduces the cache-stampede attack
+on nine interacting industry-standard services, with a Redis-based control plane that
+switches traffic, attack, and each defense on and off live
+(Section~\ref{sec:design}).
+\item An \textbf{analytical model} of baseline miss traffic, stampede amplification,
+and defended load that predicts the measured baseline database rate to within 9\%
+and explains why, under overload, completed database work collapses far below
+nominal pool capacity (Sections~\ref{sec:model} and~\ref{sec:mechanics}).
+\item A \textbf{multi-signal rule-based detector} and an \textbf{unsupervised
+IsolationForest detector}, and a detailed comparison on 12 attack episodes and
+${\approx}1{,}100$ labelled intervals covering detection latency, interval-level
+precision and recall, behavior on idle and defended traffic, threshold sensitivity,
+ROC analysis, and training-window sensitivity (Section~\ref{sec:det-results}).
+\item A \textbf{layered mitigation}, an \textbf{ablation}, and a \textbf{longitudinal
+analysis} of 14 experiment sessions showing how each engineering fix changed
+defended-mode latency and request admission, including the deployment-critical
+finding that database-level and proxy-level protection are distinct and both
+required (Sections~\ref{sec:mitigation-results}--\ref{sec:ablation}).
+\item A \textbf{fully reproducible, instrumented deployment} (single
+\texttt{docker compose up}, Prometheus/Grafana, live dashboard, demonstration
+storefront) validated by a 16-case automated end-to-end test suite, plus an explicit
+account of \textbf{measurement pitfalls} in the instrumentation that other
+practitioners are likely to repeat (Section~\ref{sec:validity}).
+\end{itemize}
+
+\subsection{Paper Organization}
+Section~\ref{sec:background} reviews the technical background on caching, overload,
+rate limiting, and anomaly detection. Section~\ref{sec:related} surveys related work
+and identifies the research gap. Section~\ref{sec:threat} defines the threat model and
+develops an analytical model of the attack. Section~\ref{sec:design} describes the
+design and implementation of CacheCollapse. Section~\ref{sec:method} sets out the
+experimental methodology and dataset. Section~\ref{sec:results} presents the results
+for each research question. Section~\ref{sec:comparative} compares CacheCollapse with
+prior work and alternative mitigations. Section~\ref{sec:discussion} discusses
+implications, engineering lessons, threats to validity, and limitations, and
+Section~\ref{sec:conclusion} concludes. Appendices give a reproduction guide, key
+configuration listings, and a mapping of the project to the attributes of a complex
+engineering problem.

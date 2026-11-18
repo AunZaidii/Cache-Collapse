@@ -1,0 +1,161 @@
+%% =====================================================================
+\section{Literature Review}
+\label{sec:related}
+%% =====================================================================
+
+We organize prior work into six threads: cache stampedes and large-scale caching;
+denial of service and application-layer attacks; attacks that target caching
+infrastructure; availability attacks in cloud and container environments; overload
+control; and detection. We close with a literature matrix and the research gap.
+
+\subsection{Cache Stampede and the Thundering Herd}
+Fitzpatrick's description of memcached established the cache-aside pattern that most
+web systems still follow \cite{fitzpatrick2004}. Nishtala et al., describing
+Facebook's memcache deployment, identify ``stale sets'' and ``thundering herds'' as
+first-order concerns and introduce \emph{leases}: a per-key token that permits only
+one client to regenerate a missing value while others briefly wait or accept slightly
+stale data. They report that leases substantially reduce peak database query rates
+\cite{nishtala2013}. Vattani, Chierichetti, and Lowenstein formalize the mitigation
+side and derive an optimal \emph{probabilistic early recomputation} rule (XFetch) in
+which an item is refreshed before its TTL with a probability that rises as expiry
+approaches \cite{vattani2015}. Workload studies of large key--value stores
+\cite{atikoglu2012} and of photo caching at scale \cite{huang2013} confirm the
+heavy skew that makes hot-key protection critical, and Fan et al.\ show that a small
+cache in front of a partitioned service provably balances load only if it holds the
+hottest keys \cite{fan2011}.
+
+All of these works treat the stampede as a \emph{performance} hazard arising from
+benign load. CacheCollapse builds directly on their mitigation insights---single-flight
+regeneration is the descendant of memcache leases---but reframes the stampede as an
+\emph{attacker-triggerable} availability vulnerability, adds detection, and measures
+end-to-end user-visible availability rather than database load alone.
+
+\subsection{Denial of Service and Application-Layer Attacks}
+Classical DDoS research classifies attacks and defenses mainly at the network and
+transport layers. Mirkovic and Reiher give the canonical taxonomy of attacks and
+defenses \cite{mirkovic2004}, and Zargar et al.\ survey flooding defenses, stressing
+that protection must span prevention, detection, and response \cite{zargar2013}.
+Application-layer DoS is distinct and harder. Xie and Yu model normal browsing behavior
+to detect attacks composed of ordinary HTTP GET requests \cite{xie2009}; Ranjan et al.\
+propose DDoS-Shield, which assigns suspicion scores to sessions and schedules requests
+to limit the damage of attackers mimicking legitimate clients \cite{ranjan2009};
+and Praseed and Thilagam survey the space, emphasizing that such attacks can be
+mounted at low volume with legitimate requests \cite{praseed2019}.
+
+A central difficulty is distinguishing attacks from \emph{flash crowds}---sudden,
+legitimate surges of interest. Jung et al.\ characterize flash crowds and DoS attacks
+and propose distinguishing features such as client distribution and per-client request
+rates \cite{jung2002}; Kandula et al.\ address attacks that deliberately mimic flash
+crowds by using CAPTCHAs and admission control to separate humans from bots
+\cite{kandula2005}. Two further lines show that damaging attacks need not be
+voluminous: low-rate ``shrew'' attacks exploit TCP's retransmission timer with
+carefully timed bursts \cite{kuzmanovic2003}, and algorithmic-complexity attacks feed
+inputs that trigger the worst-case behavior of legitimate data structures
+\cite{crosby2003}. The cache-stampede IDDoS shares the timing element of the former and
+the ``legitimate but expensive path'' element of the latter: requests are legitimate,
+the aggregate web-tier rate need not be anomalous, and the damage is produced
+downstream by cache semantics.
+
+\subsection{Attacks that Target Caching Infrastructure}
+A growing body of work treats caches themselves as attack surfaces. Triukose et al.\
+show that content-delivery networks can be abused to amplify load on an origin server
+by requesting uncacheable or cache-busting URLs \cite{triukose2009}. Guo et al.\
+demonstrate that CDN forwarding behavior can be turned against the very origin it is
+meant to protect (``CDN Judo'') \cite{guo2020}. Nguyen et al.\ introduce
+\emph{cache-poisoned denial of service} (CPDoS), in which an attacker causes an
+intermediate HTTP cache to store an error page that is then served to every subsequent
+user \cite{nguyen2019}. These works share our view that caching changes the threat
+model, but they target shared HTTP caches at the network edge and the integrity of
+cached content. CacheCollapse targets the \emph{application-internal} cache and the
+database behind it, and its attack requires neither cache-busting parameters nor
+poisoned content---only correct timing.
+
+\subsection{Availability Attacks in Cloud and Containerized Environments}
+Containers are the dominant packaging and orchestration unit for modern applications
+\cite{pahl2015,merkel2014,burns2016}, and the microservice style decomposes
+applications into many interacting services \cite{dragoni2017}. Security analyses of
+Docker catalog isolation and configuration weaknesses \cite{combe2016,sultan2019}, but
+availability has received comparatively less attention. The most directly relevant
+line is the \emph{Yo-Yo attack}, in which periodic bursts drive an auto-scaling
+controller to oscillate between scale-up and scale-down, degrading performance and
+inflating cost while evading simple volume detection \cite{sides2016,bremlerbarr2017}.
+CacheCollapse is complementary: like Yo-Yo it exploits an emergent property of a
+cloud-native pattern (there, elasticity; here, caching) using legitimate-looking
+traffic, and like Yo-Yo it must be studied in an orchestrated, resettable environment.
+Unlike Yo-Yo, it causes damage without any auto-scaler and in a single deployment.
+
+\subsection{Overload Control and Graceful Degradation}
+Systems research has long argued that services should degrade gracefully under
+overload. SEDA structures a server as stages connected by queues with admission
+controllers so that overload is shed explicitly \cite{welsh2001}, and Welsh and Culler
+later propose adaptive overload control driven by measured response times
+\cite{welsh2003}. Session-based admission control rejects new sessions under load to
+preserve service for sessions already in progress \cite{cherkasova2002}. Practitioner
+literature codifies related stability patterns---timeouts, circuit breakers, bulkheads,
+and serving stale data---\cite{nygard2018}, and site-reliability practice treats load
+shedding, client throttling, and protection against cache loss as defenses against
+cascading failure \cite{beyer2016}. Rate limiting may be enforced at a single proxy or
+globally across replicas \cite{raghavan2007}. A contribution of the present paper is to
+show empirically that these controls are \emph{not} interchangeable in the stampede
+setting: coalescing protects the database, edge rate limiting protects the request
+path, and only their combination preserves end-to-end availability.
+
+\subsection{Detection: Rules, Statistics, and Machine Learning}
+Denning's intrusion-detection model introduced statistical profiles of normal behavior
+as a basis for detecting attacks \cite{denning1987}. Chandola et al.\ and Hodge and
+Austin survey anomaly detection broadly, underlining that the choice of method
+depends on label availability, data type, and interpretability requirements
+\cite{chandola2009,hodge2004}. Two cautionary results shape our evaluation. Axelsson
+shows that because attacks are rare, even a small false-positive rate can make most
+alarms false \cite{axelsson2000}; and Sommer and Paxson argue that machine-learning
+detectors face a ``closed world'' problem in which anything not seen in training is
+flagged, so that operational benign changes look like attacks \cite{sommer2010}. Among
+unsupervised methods the Isolation Forest \cite{liu2008,liu2012} is widely used because
+it needs no labels and few samples. We therefore pair it with an explainable rule and
+evaluate both not only on attack and normal traffic but also on idle and defended
+traffic, where the closed-world problem becomes visible. ROC analysis \cite{fawcett2006}
+is used to separate the ranking quality of a score from the choice of threshold.
+
+\subsection{Literature Matrix and Research Gap}
+Table~\ref{tab:litmatrix} summarizes the most relevant works, what they contribute, and
+what they leave open relative to the problem studied here.
+
+\begin{table}[p]
+\centering
+\caption{Literature matrix: focus, approach, and gap relative to CacheCollapse.}
+\label{tab:litmatrix}
+\footnotesize
+\begin{tabularx}{\linewidth}{@{}L{2.7cm}L{2.6cm}YY@{}}
+\toprule
+Work & Focus & Approach / key finding & Gap relative to this paper \\
+\midrule
+Nishtala et al.\ 2013 \cite{nishtala2013} & Caching at scale & Leases coalesce regeneration; stale sets & Performance framing; no adversary, no detection \\
+Vattani et al.\ 2015 \cite{vattani2015} & Stampede prevention & Optimal probabilistic early recomputation (XFetch) & Assumes benign load; does not handle a burst that is already in flight \\
+Fan et al.\ 2011 \cite{fan2011} & Load balancing & Small front cache balances partitioned back ends & Capacity planning, not attack/defense \\
+Mirkovic \& Reiher 2004 \cite{mirkovic2004} & DDoS taxonomy & Classifies attacks and defenses & Network-layer focus \\
+Zargar et al.\ 2013 \cite{zargar2013} & DDoS defense survey & Prevention--detection--response framing & Flooding attacks; no cache semantics \\
+Xie \& Yu 2009 \cite{xie2009} & App-layer DDoS detection & Models normal browsing (HSMM) & Detection only; no mitigation; no cache \\
+Ranjan et al.\ 2009 \cite{ranjan2009} & App-layer DDoS mitigation & Suspicion-based request scheduling & Assumes attacker sessions differ in behavior \\
+Jung et al.\ 2002 \cite{jung2002}; Kandula et al.\ 2005 \cite{kandula2005} & Flash crowd vs.\ attack & Client distribution; CAPTCHA + admission control & Web-tier volume focus; not downstream amplification \\
+Kuzmanovic \& Knightly 2003 \cite{kuzmanovic2003} & Low-rate DoS & Timed bursts exploit TCP timers & Transport layer \\
+Crosby \& Wallach 2003 \cite{crosby2003} & Algorithmic complexity & Inputs trigger worst-case paths & Single-process data structures \\
+Nguyen et al.\ 2019 \cite{nguyen2019}; Guo et al.\ 2020 \cite{guo2020} & Attacks on HTTP caches/CDNs & Cache poisoning; CDN abuse against origin & Shared edge caches; integrity or forwarding, not expiry timing \\
+Sides et al.\ 2016 \cite{sides2016}; Bremler-Barr et al.\ 2017 \cite{bremlerbarr2017} & Cloud availability (Yo-Yo) & Bursts make auto-scaler oscillate & Targets elasticity, not caching; no layered mitigation \\
+Combe et al.\ 2016 \cite{combe2016}; Sultan et al.\ 2019 \cite{sultan2019} & Container security & Isolation and configuration risks & No availability attack instrumented end to end \\
+Welsh et al.\ 2001/2003 \cite{welsh2001,welsh2003} & Overload control & Staged queues; adaptive admission & General overload; no attack model \\
+Liu et al.\ 2008/2012 \cite{liu2008,liu2012} & Anomaly detection & Isolation Forest & Method only; no domain evaluation \\
+Sommer \& Paxson 2010 \cite{sommer2010} & ML for intrusion detection & Closed-world critique & Position paper; motivates our idle/defended evaluation \\
+\midrule
+\textbf{CacheCollapse} & Cache-stampede IDDoS & Containerized testbed + analytical model + rule \& ML detection + layered mitigation + ablation & Single-host, synthetic traffic (Sec.~\ref{sec:validity}) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{Research gap.} Prior work offers (a)~mitigations for stampedes framed as a
+performance problem, (b)~detectors for application-layer floods framed at the web
+tier, and (c)~analyses of cache- and cloud-specific availability attacks at the network
+edge or the auto-scaler. To our knowledge no prior study combines, in one reproducible
+containerized environment, an \emph{adversarial} treatment of the application-internal
+cache stampede, \emph{both} explainable and learned detection evaluated beyond the
+attack/normal dichotomy, and an \emph{ablation} of layered mitigations measured at the
+level of user-visible availability. CacheCollapse addresses that gap.

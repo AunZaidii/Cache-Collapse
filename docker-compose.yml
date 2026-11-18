@@ -1,0 +1,121 @@
+# CacheCollapse — full 9-container lab.
+# Run everything with:  docker compose up --build
+# Then open:            http://localhost:8080   (the live dashboard)
+
+services:
+
+  # 1) Front door / reverse proxy. Routes the browser + traffic to the right place.
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on: [frontend, backend, monitor]
+    ports:
+      - "${PUBLIC_PORT:-8080}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/dynamic:/etc/nginx/dynamic:ro
+    # Run nginx, and reload it whenever the edge rate-limit file changes (the
+    # dashboard's Rate-limiting toggle rewrites that file).
+    command:
+      - sh
+      - -c
+      - |
+        nginx -g 'daemon off;' &
+        prev=""
+        while :; do
+          sleep 1
+          cur=$$(cat /etc/nginx/dynamic/ratelimit.conf 2>/dev/null)
+          if [ "$$cur" != "$$prev" ]; then prev="$$cur"; nginx -s reload 2>/dev/null; fi
+        done
+    networks: [cachenet]
+
+  # 2) Web app. Answers /products/<id>. Holds the cache-locking + rate-limit logic.
+  backend:
+    build: ./backend
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+      DB_HOST: db
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_started}
+    networks: [cachenet]
+
+  # 3) Cache. Also used as the shared control bus (run state + defense toggles).
+  redis:
+    image: redis:7-alpine
+    networks: [cachenet]
+
+  # 4) Database — the victim. Seeded with fake products on first start.
+  db:
+    image: postgres:16-alpine
+    env_file: .env
+    volumes:
+      - ./database/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+      - ./database/seed.sql:/docker-entrypoint-initdb.d/02_seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [cachenet]
+
+  # 5) Load generator — makes normal traffic and the burst attack. Reads its
+  #    orders (traffic on/off, attack on/off) from Redis, set by the dashboard.
+  loadgen:
+    build: ./loadgen
+    environment:
+      REDIS_HOST: redis
+      TARGET_URL: http://nginx:80
+    depends_on: [redis, nginx]
+    networks: [cachenet]
+
+  # 6) Monitor — scrapes metrics each second, runs rule + ML detection, logs CSV,
+  #    streams live data to the dashboard, and handles the control buttons.
+  monitor:
+    build: ./monitor
+    env_file: .env
+    environment:
+      REDIS_HOST: redis
+      BACKEND_URL: http://backend:5000
+    volumes:
+      - ./results:/app/data
+      - ./nginx/dynamic:/app/nginxdyn        # to toggle nginx edge rate limiting live
+    depends_on: [redis, backend]
+    networks: [cachenet]
+
+  # 7) Static server for the custom live dashboard (HTML/CSS/JS).
+  frontend:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+    networks: [cachenet]
+
+  # 8) Prometheus — time-series collector for the industry-style dashboards.
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on: [backend]
+    networks: [cachenet]
+
+  # 9) Grafana — ready-made dashboards reading from Prometheus.
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
+    networks: [cachenet]
+
+networks:
+  cachenet:
+    driver: bridge

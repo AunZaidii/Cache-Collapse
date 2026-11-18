@@ -1,0 +1,172 @@
+%% =====================================================================
+\section{Experimental Methodology}
+\label{sec:method}
+%% =====================================================================
+
+\subsection{Environment}
+All experiments ran on a single Windows~11 Pro workstation under Docker Desktop
+(Docker Engine 29.8.2), with the nine containers of Table~\ref{tab:services} on one
+Compose bridge network. Container resource limits were left at Docker Desktop defaults.
+Running every component on one host removes network variability between tiers and
+makes runs comparable, at the cost of shared CPU contention between the attacker,
+the victim, and the instrumentation (Section~\ref{sec:validity}).
+
+\subsection{Experimental Conditions and Protocol}
+Experiments follow a three-condition protocol, executed from the dashboard presets:
+\begin{description}[leftmargin=1.2em,style=nextline]
+\item[E1 -- Baseline.] Normal traffic only, defenses off.
+\item[E2 -- Attack, undefended.] Normal traffic plus the rotating burst attack, both
+defenses off.
+\item[E3 -- Attack, defended.] Normal traffic plus the attack, with cache locking,
+application rate limiting, and edge rate limiting enabled.
+\end{description}
+A typical session cycles E1~$\rightarrow$~E2~$\rightarrow$~E1~$\rightarrow$~E3 with
+roughly 5--20~s per condition, so that each undefended and each defended attack is
+preceded by a fresh normal period from which the detectors can (re)learn the
+baseline. In addition, the final session contains one long defended run spanning
+${\approx}8.1$~h of wall-clock time, used as a soak test of the defense; it contains
+4.5~h of valid samples, the remainder being 15 gaps during which the host was asleep.
+Two further procedures were used:
+\begin{itemize}[leftmargin=*]
+\item \textbf{Ablation.} Starting from E2, defenses were enabled one at a time (cache
+locking only; plus stale-while-revalidate; plus edge rate limiting) while observing the
+dashboard and the CacheShop storefront (Section~\ref{sec:ablation}). Because the
+defense implementation evolved during the project, the 14 sessions that include
+defended traffic also form a natural longitudinal ablation, analyzed in
+Section~\ref{sec:longitudinal}.
+\item \textbf{Automated validation.} A 16-case end-to-end test suite drives the system
+through the same control API and checks functional and quantitative success criteria
+(Section~\ref{sec:validation}).
+\end{itemize}
+
+\subsection{Dataset}
+The monitor writes one CSV row per sampling interval (Table~\ref{tab:csv}). A new file
+is started each time the monitor container boots. The study uses all 18 files produced
+on 22~October~2026, totalling 92{,}531 rows and ${\approx}28$~h of wall-clock logging,
+much of it idle (Table~\ref{tab:dataset}). The sampling interval was 1~s in the first
+eight sessions and 0.5~s thereafter.
+
+\begin{table}[t]
+\centering
+\caption{Columns of the monitor's CSV log (one row per sampling interval).}
+\label{tab:csv}
+\small
+\begin{tabularx}{\linewidth}{@{}L{2.6cm}Y@{}}
+\toprule
+Column & Definition \\
+\midrule
+\texttt{ts} & Unix timestamp of the sample \\
+\texttt{mode} & idle / normal / attack / protected (attack with $\ge$1 defense on) \\
+\texttt{rps} & Application requests per second (all outcomes, incl.\ 429 and 503) \\
+\texttt{db\_qps} & Database query \emph{attempts} per second \\
+\texttt{cache\_hits}, \texttt{cache\_misses} & Counts in the interval \\
+\texttt{hit\_rate} & hits / (hits + misses) in the interval \\
+\texttt{resp\_avg\_ms} & Mean in-application latency of requests completed in the interval \\
+\texttt{resp\_p95\_ms} & Histogram-bucket approximation of p95 latency \\
+\texttt{failed} & \emph{Count} of HTTP~503 responses in the interval (not a rate) \\
+\texttt{rule\_alert}, \texttt{ml\_alert} & Detector outputs (0/1) \\
+\texttt{ml\_score} & Normalized anomaly score for display (0.08 = model not yet trained) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Dataset summary. ``Final'' is the session with the complete defense
+(edge rate limiting active), on which the main results are computed.}
+\label{tab:dataset}
+\small
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Subset & Rows & Idle & Normal & Attack & Defended \\
+\midrule
+All 18 sessions & 92{,}531 & 50{,}732 & 1{,}477 & 1{,}648 & 38{,}674 \\
+Final session (16:58), valid rows & 61{,}923 & 25{,}586 & 332 & 733 & 35{,}272 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Choice of the primary dataset.} The defense evolved during the day
+(Section~\ref{sec:lessons}). Only in the last session is the edge rate limiter
+demonstrably active: the application's request rate in defended mode is pinned at the
+configured 50~req/s (median 50, IQR 47--53), whereas in every earlier session it is
+170--350~req/s. We therefore report the main results on the final session (12
+undefended attack episodes totalling 13~min of valid samples, 10 defended episodes
+totalling 5.6~h of which 4.5~h are the soak run, and 12 normal episodes) and use the earlier sessions for the longitudinal
+analysis and for robustness checks.
+
+\subsection{Pre-processing}
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Interval length.} For each row, $\Delta t$ is the difference between
+consecutive timestamps. Rows with $\Delta t\notin(0.25, 2.0)$~s are excluded (245 of
+92{,}531 rows, 0.26\%). These arise when the host sleeps or the monitor stalls and produce
+meaningless rates; for example one such row in the soak run reports a mean latency of
+over 1{,}000~s.
+\item \textbf{Failure rate.} Because \texttt{failed} is a per-interval count, the
+failure rate is computed as $\texttt{failed}/\Delta t$.
+\item \textbf{Miss ratio.} Computed as misses/(hits+misses) per interval, 0 when both
+are zero.
+\item \textbf{Episodes.} Each maximal run of consecutive rows with the same mode is an
+\emph{episode}. Episodes shorter than 8 rows are excluded from per-episode analyses
+(they are transitions caused by rapid button presses).
+\item \textbf{ML readiness.} Rows with \texttt{ml\_score}$=0.08$ and no ML alert are
+those in which the forest had not yet been trained; per-episode ML results report
+whether the model was ready.
+\end{enumerate}
+
+\subsection{Ground Truth and Evaluation Metrics}
+The mode recorded in each row provides ground truth: intervals in \emph{attack} mode
+are positives (the attack is running and undefended) and intervals in \emph{normal}
+mode are negatives. Defended and idle intervals are reported separately, because the
+correct answer there is a matter of definition: during a defended attack the attack
+\emph{is} present but causes no harm, and during idle periods there is no traffic at
+all. Table~\ref{tab:metric-defs} defines the evaluation metrics.
+
+\begin{table}[t]
+\centering
+\caption{Evaluation metrics.}
+\label{tab:metric-defs}
+\small
+\begin{tabularx}{\linewidth}{@{}L{3.6cm}Y@{}}
+\toprule
+Metric & Definition \\
+\midrule
+DB load & Median (IQR, p95, max) of \texttt{db\_qps} over intervals in a condition \\
+Latency & Median (IQR, p95, max) of per-interval mean latency \\
+Failure rate & HTTP 503 per second; fraction of intervals with any 503 \\
+Reduction factor & Ratio of medians (undefended / defended), 95\% bootstrap CI \cite{efron1994} \\
+Coalescing ratio $\rho$ & Total cache misses / total DB attempts in a condition \\
+Completed DB queries & $\max(0, q_{db}\Delta t - n_{503})/\Delta t$ per interval \\
+Detection latency & Time from first interval of an attack episode to first alert \\
+Episode recall & Fraction of attack episodes with at least one alert \\
+Interval precision / recall / F1 & Over attack (positive) and normal (negative) intervals \\
+False-positive rate & Alerts in normal intervals / normal intervals \\
+ROC AUC & Area under the ROC curve of a continuous score \cite{fawcett2006} \\
+Recovery time & First interval of a new condition to the first of two consecutive healthy intervals (Eq.~\ref{eq:healthy}) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Offline Analyses}
+Three analyses go beyond the detectors' live output.
+\begin{itemize}[leftmargin=*]
+\item \textbf{Threshold sensitivity of the rule.} Equation~\eqref{eq:rule} is
+re-evaluated on the logged features over a grid of $K\in\{2,3,5,8,12\}$,
+$\tau_L\in\{100,150,200,300\}$~ms and $\tau_m\in\{0.3,0.5,0.7\}$, using the median
+normal database rate of the final session (11~q/s) as baseline.
+\item \textbf{Single-signal baselines.} Each condition of the rule, a ``failures
+present'' detector, and a pure volume threshold (rps$\,>100$) are evaluated alone, both
+on the attack/normal intervals and on 2{,}080 \emph{absorbed-burst} intervals: defended
+intervals from six earlier sessions in which the full attack volume reached the
+application (median 280~req/s) but was served from cache with low database load
+(median 2~q/s) and low latency (median 26~ms). These are high-volume, harmless
+intervals---a laboratory proxy for a flash crowd that the cache absorbs.
+\item \textbf{Offline IsolationForest replay.} The detector pipeline is re-run offline
+with the same features, scaler, and hyper-parameters: it is trained on the first half
+of the final session's normal intervals (166) and tested on the second half (166) plus
+all 733 attack intervals. This permits ROC analysis, a sweep of the
+\texttt{contamination} parameter, a sweep of the training-window size, and a
+random-seed stability check.
+\end{itemize}
+All analysis code uses pandas, NumPy, scikit-learn, and Matplotlib, and reads only the
+CSV logs.
